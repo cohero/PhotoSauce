@@ -1,64 +1,47 @@
 ﻿using System;
-using System.Linq;
-using System.Drawing;
-using System.Diagnostics;
+using System.Buffers;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Diagnostics.CodeAnalysis;
 
 #if NETFRAMEWORK
+using System.Linq;
 using System.Configuration;
 using System.Collections.Specialized;
 #endif
 
-using PhotoSauce.MagicScaler.Interop;
+using Blake2Fast;
 
 namespace PhotoSauce.MagicScaler
 {
 	internal static class MiscExtensions
 	{
-		public static WICRect FromGdiRect(this WICRect wr, in Rectangle r)
-		{
-			wr.X = r.X;
-			wr.Y = r.Y;
-			wr.Width = r.Width;
-			wr.Height = r.Height;
+		public static Orientation Clamp(this Orientation o) => o < Orientation.Normal? Orientation.Normal : o > Orientation.Rotate270 ? Orientation.Rotate270 : o;
 
-			return wr;
-		}
+		public static GifDisposalMethod Clamp(this GifDisposalMethod m) => m < GifDisposalMethod.Preserve || m > GifDisposalMethod.RestorePrevious ? GifDisposalMethod.Preserve : m;
 
-		public static WICRect ToWicRect(this Rectangle r) => new WICRect { X = r.X, Y = r.Y, Width = r.Width, Height = r.Height };
-
-		public static Rectangle ToGdiRect(this WICRect r) => new Rectangle(r.X, r.Y, r.Width, r.Height);
-
-		public static WICBitmapTransformOptions ToWicTransformOptions(this Orientation o)
-		{
-			int orientation = (int)o;
-
-			var opt = WICBitmapTransformOptions.WICBitmapTransformRotate0;
-			if (orientation == 3 || orientation == 4)
-				opt = WICBitmapTransformOptions.WICBitmapTransformRotate180;
-			else if (orientation == 6 || orientation == 7)
-				opt = WICBitmapTransformOptions.WICBitmapTransformRotate90;
-			else if (orientation == 5 || orientation == 8)
-				opt = WICBitmapTransformOptions.WICBitmapTransformRotate270;
-
-			if (orientation == 2 || orientation == 4 || orientation == 5 || orientation == 7)
-				opt |= WICBitmapTransformOptions.WICBitmapTransformFlipHorizontal;
-
-			return opt;
-		}
-
-		public static bool RequiresDimensionSwap(this Orientation o) => o > Orientation.FlipVertical;
+		public static bool SwapsDimensions(this Orientation o) => o > Orientation.FlipVertical;
 
 		public static bool RequiresCache(this Orientation o) => o > Orientation.FlipHorizontal;
 
+		public static bool FlipsX(this Orientation o) => o == Orientation.FlipHorizontal || o == Orientation.Rotate180 || o == Orientation.Rotate270 || o == Orientation.Transverse;
+
+		public static bool FlipsY(this Orientation o) => o == Orientation.FlipVertical || o == Orientation.Rotate180 || o == Orientation.Rotate90 || o == Orientation.Transverse;
+
+		public static Orientation Invert(this Orientation o) => o == Orientation.Rotate270 ? Orientation.Rotate90 : o == Orientation.Rotate90 ? Orientation.Rotate270 : o;
+
+		public static bool IsSubsampledX(this ChromaSubsampleMode o) => o == ChromaSubsampleMode.Subsample420 || o == ChromaSubsampleMode.Subsample422;
+
+		public static bool IsSubsampledY(this ChromaSubsampleMode o) => o == ChromaSubsampleMode.Subsample420 || o == ChromaSubsampleMode.Subsample440;
+
 		public static bool InsensitiveEquals(this string s1, string s2) => string.Equals(s1, s2, StringComparison.OrdinalIgnoreCase);
 
-		public static string GetFileExtension(this FileFormat fmt, string preferredExtension = null)
+		public static string GetFileExtension(this FileFormat fmt, string? preferredExtension = null)
 		{
 			if (fmt == FileFormat.Png8)
 				fmt = FileFormat.Png;
 
-			string ext = fmt.ToString().ToLower();
+			string ext = fmt.ToString().ToLowerInvariant();
 			if (!string.IsNullOrEmpty(preferredExtension))
 			{
 				if (preferredExtension[0] == '.')
@@ -71,14 +54,27 @@ namespace PhotoSauce.MagicScaler
 			return ext;
 		}
 
-		public static ArraySegment<T> Zero<T>(this ArraySegment<T> a)
+		public static void TryReturn<T>(this ArrayPool<T> pool, T[]? buff)
 		{
-			Array.Clear(a.Array, a.Offset, a.Count);
-			return a;
+			if (buff is not null)
+				pool.Return(buff);
 		}
 
-		public static TValue GetValueOrDefault<TKey, TValue>(this IDictionary<TKey, TValue> dic, TKey key, Func<TValue> valueFactory = null) =>
-			dic.TryGetValue(key, out var value) ? value : valueFactory is null ? default : valueFactory();
+		public static Guid FinalizeToGuid<T>(this T hasher) where T : IBlake2Incremental
+		{
+			var hash = (Span<byte>)stackalloc byte[hasher.DigestLength];
+			hasher.Finish(hash);
+
+			return MemoryMarshal.Read<Guid>(hash);
+		}
+
+		[return: MaybeNull]
+		public static TValue GetValueOrDefault<TKey, TValue>(this IDictionary<TKey, TValue> dic, TKey key, TValue defaultValue = default) where TKey : notnull =>
+			dic.TryGetValue(key, out var value) ? value : defaultValue;
+
+		[return: MaybeNull]
+		public static TValue GetValueOrDefault<TKey, TValue>(this IReadOnlyDictionary<TKey, TValue> dic, TKey key, TValue defaultValue = default) where TKey : notnull =>
+			dic.TryGetValue(key, out var value) ? value : defaultValue;
 
 #if NETFRAMEWORK
 		public static IDictionary<string, string> ToDictionary(this NameValueCollection nv) =>
@@ -88,27 +84,12 @@ namespace PhotoSauce.MagicScaler
 			kv.AllKeys.Where(k => !string.IsNullOrEmpty(k)).ToDictionary(k => k, k => kv[k].Value, StringComparer.OrdinalIgnoreCase);
 #endif
 
-		public static IDictionary<TKey, TValue> Coalesce<TKey, TValue>(this IDictionary<TKey, TValue> dic1, IDictionary<TKey, TValue> dic2)
+		public static IDictionary<TKey, TValue> Coalesce<TKey, TValue>(this IDictionary<TKey, TValue> dic1, IDictionary<TKey, TValue> dic2) where TKey : notnull
 		{
 			foreach (var kv in dic2)
 				dic1[kv.Key] = kv.Value;
 
 			return dic1;
 		}
-
-#if CUSTOM_MARSHAL
-		public static TOut[] ConvertAll<TIn, TOut>(this TIn[] array, Converter<TIn, TOut> converter) => Array.ConvertAll(array, converter);
-#else
-		public static TOut[] ConvertAll<TIn, TOut>(this TIn[] array, Func<TIn, TOut> converter)
-		{
-			var res = new TOut[array.Length];
-			for (int i = 0; i < array.Length; i++)
-				res[i] = converter(array[i]);
-
-			return res;
-		}
-#endif
-
-		public static double ElapsedMilliseconds(this Stopwatch s) => (double)s.ElapsedTicks / Stopwatch.Frequency * 1000;
 	}
 }

@@ -1,0 +1,27 @@
+<Project>
+
+	<Import Project="$(MSBuildThisFileDirectory)..\build\Common.props" />
+
+	<PropertyGroup>
+		<Nullable>annotations</Nullable>
+		<SignAssembly>true</SignAssembly>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)'!='Debug'">
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)'=='Dist'">
+		<GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+		<DeterministicSourcePaths>true</DeterministicSourcePaths>
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+	</PropertyGroup>
+
+	<ItemGroup Condition="'$(Configuration)'=='Dist'">
+		<PackageReference Include="Microsoft.SourceLink.GitHub" Version="1.0.0" PrivateAssets="all" />
+		<PackageReference Include="SauceControl.InheritDoc" Version="1.0.0" PrivateAssets="all" />
+	</ItemGroup>
+
+</Project>

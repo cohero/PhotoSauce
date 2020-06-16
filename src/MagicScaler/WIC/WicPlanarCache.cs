@@ -1,72 +1,55 @@
 ﻿using System;
 using System.Buffers;
-using System.Drawing;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 
-using PhotoSauce.MagicScaler.Interop;
+using PhotoSauce.Interop.Wic;
 
 namespace PhotoSauce.MagicScaler
 {
-	internal enum WicPlane { Luma, Chroma }
-
 	internal class WicPlanarCache : IDisposable
 	{
-		private readonly double subsampleRatioX, subsampleRatioY;
+		private enum WicPlane { Y, Cb, Cr }
+
 		private readonly uint scaledWidth, scaledHeight;
+		private readonly int subsampleRatioX, subsampleRatioY;
 		private readonly int strideY, strideC;
+		private readonly int buffHeight;
 
 		private readonly IWICPlanarBitmapSourceTransform sourceTransform;
 		private readonly WICBitmapTransformOptions sourceTransformOptions;
-		private readonly PlanarPixelSource sourceY, sourceC;
+		private readonly PlanarCachePixelSource sourceY, sourceCb, sourceCr;
+		private readonly PixelBuffer buffY, buffCb, buffCr;
 		private readonly WICRect scaledCrop;
-		private readonly WICRect sourceRect;
-		private readonly WICBitmapPlane[] sourcePlanes;
 
-		private int buffHeightY, buffHeightC;
-		private int startY = -1, loadedY = -1, nextY = 0;
-		private int startC = -1, loadedC = -1, nextC = 0;
-		private ArraySegment<byte> lineBuffY, lineBuffC;
+		private WICBitmapPlane[] sourcePlanes;
 
-		public WicPlanarCache(IWICPlanarBitmapSourceTransform source, WICBitmapPlaneDescription descY, WICBitmapPlaneDescription descC, in Rectangle crop, WICBitmapTransformOptions transformOptions, uint width, uint height, double ratio)
+		public WicPlanarCache(IWICPlanarBitmapSourceTransform source, ReadOnlySpan<WICBitmapPlaneDescription> desc, WICBitmapTransformOptions transformOptions, uint width, uint height, in PixelArea crop)
 		{
-			subsampleRatioX = Math.Ceiling((double)descY.Width / descC.Width);
-			subsampleRatioY = Math.Ceiling((double)descY.Height / descC.Height);
+			var descY = desc[0];
+			var descCb = desc[1];
+			var descCr = desc[2];
+
+			// IWICPlanarBitmapSourceTransform only supports 4:2:0, 4:4:0, 4:2:2, and 4:4:4 subsampling, so ratios will always be 1 or 2
+			subsampleRatioX = (int)((descY.Width + 1u) / descCb.Width);
+			subsampleRatioY = (int)((descY.Height + 1u) / descCb.Height);
 
 			var scrop = new WICRect {
-				X = (int)Math.Floor(crop.X / ratio),
-				Y = (int)Math.Floor(crop.Y / ratio),
-				Width = Math.Min((int)Math.Ceiling(crop.Width / ratio), (int)descY.Width),
-				Height = Math.Min((int)Math.Ceiling(crop.Height / ratio), (int)descY.Height)
+				X = MathUtil.PowerOfTwoFloor(crop.X, subsampleRatioX),
+				Y = MathUtil.PowerOfTwoFloor(crop.Y, subsampleRatioY),
 			};
+			scrop.Width = Math.Min(MathUtil.PowerOfTwoCeiling(crop.Width, subsampleRatioX), (int)descY.Width - scrop.X);
+			scrop.Height = Math.Min(MathUtil.PowerOfTwoCeiling(crop.Height, subsampleRatioY), (int)descY.Height - scrop.Y);
 
-			if (subsampleRatioX > 1d)
-			{
-				if (scrop.X % subsampleRatioX > double.Epsilon)
-					scrop.X = (int)(scrop.X / subsampleRatioX) * (int)subsampleRatioX;
-				if (scrop.Width % subsampleRatioX > double.Epsilon)
-					scrop.Width = (int)Math.Min(Math.Ceiling(scrop.Width / subsampleRatioX) * (int)subsampleRatioX, descY.Width - scrop.X);
+			descCb.Width = Math.Min((uint)MathUtil.DivCeiling(scrop.Width, subsampleRatioX), descCb.Width);
+			descCb.Height = Math.Min((uint)MathUtil.DivCeiling(scrop.Height, subsampleRatioY), descCb.Height);
 
-				descC.Width = Math.Min((uint)Math.Ceiling(scrop.Width / subsampleRatioX), descC.Width);
-				descY.Width = (uint)Math.Min(descC.Width * subsampleRatioX, scrop.Width);
-			}
-			else
-			{
-				descC.Width = descY.Width = (uint)scrop.Width;
-			}
+			descY.Width = Math.Min(descCb.Width * (uint)subsampleRatioX, (uint)scrop.Width);
+			descY.Height = Math.Min(descCb.Height * (uint)subsampleRatioY, (uint)scrop.Height);
 
-			if (subsampleRatioY > 1d)
-			{
-				if (scrop.Y % subsampleRatioY > double.Epsilon)
-					scrop.Y = (int)(scrop.Y / subsampleRatioY) * (int)subsampleRatioY;
-				if (scrop.Height % subsampleRatioY > double.Epsilon)
-					scrop.Height = (int)Math.Min(Math.Ceiling(scrop.Height / subsampleRatioY) * (int)subsampleRatioY, descY.Height - scrop.Y);
-
-				descC.Height = Math.Min((uint)Math.Ceiling(scrop.Height / subsampleRatioY), descC.Height);
-				descY.Height = (uint)Math.Min(descC.Height * subsampleRatioY, scrop.Height);
-			}
-			else
-			{
-				descC.Height = descY.Height = (uint)scrop.Height;
-			}
+			descCr.Width = descCb.Width;
+			descCr.Height = descCb.Height;
 
 			sourceTransform = source;
 			sourceTransformOptions = transformOptions;
@@ -74,158 +57,116 @@ namespace PhotoSauce.MagicScaler
 			scaledWidth = width;
 			scaledHeight = height;
 
-			strideY = scrop.Width + 3 & ~3;
-			strideC = (int)Math.Ceiling(scrop.Width / subsampleRatioX) * 2 + 3 & ~3;
-			buffHeightY = Math.Min(scrop.Height, transformOptions.RequiresCache() ? scrop.Height : 16);
-			buffHeightC = (int)Math.Ceiling(buffHeightY / subsampleRatioY);
+			strideY = MathUtil.PowerOfTwoCeiling((int)descY.Width, IntPtr.Size);
+			strideC = MathUtil.PowerOfTwoCeiling((int)descCb.Width, IntPtr.Size);
 
-			sourceY = new PlanarPixelSource(this, WicPlane.Luma, descY);
-			sourceC = new PlanarPixelSource(this, WicPlane.Chroma, descC);
-			sourceRect = new WICRect { X = scaledCrop.X, Width = scaledCrop.Width };
-			sourcePlanes = new[] {
-				new WICBitmapPlane { Format = sourceY.Format.FormatGuid, cbStride = (uint)strideY },
-				new WICBitmapPlane { Format = sourceC.Format.FormatGuid, cbStride = (uint)strideC }
+			buffHeight = Math.Min(scrop.Height, transformOptions.RequiresCache() ? (int)descY.Height : 16);
+			buffY = new PixelBuffer(buffHeight, strideY);
+			buffCb = new PixelBuffer(MathUtil.DivCeiling(buffHeight, subsampleRatioY), strideC);
+			buffCr = new PixelBuffer(MathUtil.DivCeiling(buffHeight, subsampleRatioY), strideC);
+
+			sourceY = new PlanarCachePixelSource(this, WicPlane.Y, descY);
+			sourceCb = new PlanarCachePixelSource(this, WicPlane.Cb, descCb);
+			sourceCr = new PlanarCachePixelSource(this, WicPlane.Cr, descCr);
+
+			sourcePlanes = ArrayPool<WICBitmapPlane>.Shared.Rent(WicTransforms.PlanarPixelFormats.Length);
+			sourcePlanes[0] = new WICBitmapPlane { Format = descY.Format, cbStride = (uint)strideY };
+			sourcePlanes[1] = new WICBitmapPlane { Format = descCb.Format, cbStride = (uint)strideC };
+			sourcePlanes[2] = new WICBitmapPlane { Format = descCr.Format, cbStride = (uint)strideC };
+		}
+
+		public PixelSource SourceY => sourceY;
+		public PixelSource SourceCb => sourceCb;
+		public PixelSource SourceCr => sourceCr;
+
+		unsafe private void copyPixels(WicPlane plane, in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer)
+		{
+			Debug.Assert(cbStride >= prc.Width);
+			Debug.Assert(cbBufferSize >= (prc.Height - 1) * cbStride + prc.Width);
+
+			var buff = plane switch {
+				WicPlane.Cb => buffCb,
+				WicPlane.Cr => buffCr,
+				_ => buffY
 			};
+
+			for (int y = 0; y < prc.Height; y++)
+			{
+				int line = prc.Y + y;
+				if (!buff.ContainsLine(line))
+					loadBuffer(plane, line);
+
+				var lspan = buff.PrepareRead(line, 1).Slice(prc.X, prc.Width);
+				Unsafe.CopyBlockUnaligned(ref Unsafe.AsRef<byte>((byte*)pbBuffer + y * cbStride), ref MemoryMarshal.GetReference(lspan), (uint)lspan.Length);
+			}
 		}
 
-		unsafe private void loadBuffer(WicPlane plane, in Rectangle prc)
+		unsafe private void loadBuffer(WicPlane plane, int line)
 		{
-			if (lineBuffY.Array == null || ((startY >= 0 || startC >= 0) && (nextY < buffHeightY / 4 || nextC < buffHeightC / 4)))
+			int prcY = MathUtil.PowerOfTwoFloor(plane == WicPlane.Y ? line : line * subsampleRatioY, subsampleRatioY);
+
+			var sourceRect = new WICRect {
+				X = scaledCrop.X,
+				Y = scaledCrop.Y + prcY,
+				Width = scaledCrop.Width,
+				Height = Math.Min(buffHeight, scaledCrop.Height - prcY)
+			};
+
+			int lineY = prcY;
+			int lineCb = lineY / subsampleRatioY, lineCr = lineCb;
+			int heightY = sourceRect.Height;
+			int heightCb = MathUtil.DivCeiling(heightY, subsampleRatioY), heightCr = heightCb;
+
+			var spanY = buffY.PrepareLoad(ref lineY, ref heightY);
+			var spanCb = buffCb.PrepareLoad(ref lineCb, ref heightCb);
+			var spanCr = buffCr.PrepareLoad(ref lineCr, ref heightCr);
+
+			fixed (byte* pBuffY = spanY, pBuffCb = spanCb, pBuffCr = spanCr)
 			{
-				if (lineBuffY.Array != null)
-				{
-					buffHeightY = Math.Min(buffHeightY * 2, (int)scaledHeight);
-					buffHeightC = Math.Min(buffHeightC * 2, (int)Math.Ceiling(buffHeightY / subsampleRatioY));
-				}
+				sourcePlanes[0].pbBuffer = (IntPtr)pBuffY;
+				sourcePlanes[1].pbBuffer = (IntPtr)pBuffCb;
+				sourcePlanes[2].pbBuffer = (IntPtr)pBuffCr;
+				sourcePlanes[0].cbBufferSize = (uint)spanY.Length;
+				sourcePlanes[1].cbBufferSize = (uint)spanCb.Length;
+				sourcePlanes[2].cbBufferSize = (uint)spanCr.Length;
 
-				var tbuffY = new ArraySegment<byte>(ArrayPool<byte>.Shared.Rent(buffHeightY * strideY), 0, buffHeightY * strideY);
-				var tbuffC = new ArraySegment<byte>(ArrayPool<byte>.Shared.Rent(buffHeightC * strideC), 0, buffHeightC * strideC);
-
-				if (lineBuffY.Array != null)
-				{
-					fixed (byte* ptbuffY = &tbuffY.Array[0], ptbuffC = &tbuffC.Array[0], pcbuffY = &lineBuffY.Array[0], pcbuffC = &lineBuffC.Array[0])
-					{
-						Buffer.MemoryCopy(pcbuffY, ptbuffY, tbuffY.Array.Length, lineBuffY.Count);
-						Buffer.MemoryCopy(pcbuffC, ptbuffC, tbuffC.Array.Length, lineBuffC.Count);
-					}
-
-					ArrayPool<byte>.Shared.Return(lineBuffY.Array);
-					ArrayPool<byte>.Shared.Return(lineBuffC.Array);
-				}
-
-				lineBuffY = tbuffY;
-				lineBuffC = tbuffC;
-			}
-
-			fixed (byte* pBuffY = &lineBuffY.Array[0], pBuffC = &lineBuffC.Array[0])
-			{
-				int offsY = 0, offsC = 0;
-				int prcY = plane == WicPlane.Luma ? prc.Y : (int)Math.Ceiling(prc.Y * subsampleRatioY);
-
-				if (prcY % subsampleRatioY > double.Epsilon)
-					prcY = (int)(prcY / subsampleRatioY) * (int)subsampleRatioY;
-
-				if (startY == -1)
-				{
-					startY = prcY;
-					startC = (int)(startY / subsampleRatioY);
-				}
-				else if (nextY < buffHeightY || nextC < buffHeightC)
-				{
-					int minY = (int)Math.Min(nextC * subsampleRatioY, nextY);
-					int minC = (int)(minY / subsampleRatioY);
-					minY = minC * (int)subsampleRatioY;
-
-					Buffer.MemoryCopy(pBuffY + minY * strideY, pBuffY, lineBuffY.Array.Length, (buffHeightY - minY) * strideY);
-					Buffer.MemoryCopy(pBuffC + minC * strideC, pBuffC, lineBuffC.Array.Length, (buffHeightC - minC) * strideC);
-
-					offsY = loadedY - startY - minY;
-					offsC = (int)(loadedY / subsampleRatioY) - startC - minC;
-
-					startY += minY;
-					startC += minC;
-
-					nextY -= minY;
-					nextC -= minC;
-				}
-				else
-				{
-					startY += buffHeightY;
-					startC += buffHeightC;
-				}
-
-				sourceRect.Y = Math.Max(Math.Max(0, scaledCrop.Y + startY + offsY), loadedY);
-				sourceRect.Height = Math.Min(buffHeightY - offsY, scaledCrop.Height - prcY);
-
-				sourcePlanes[0].pbBuffer = (IntPtr)(pBuffY + offsY * strideY);
-				sourcePlanes[1].pbBuffer = (IntPtr)(pBuffC + offsC * strideC);
-				sourcePlanes[0].cbBufferSize = (uint)lineBuffY.Count;
-				sourcePlanes[1].cbBufferSize = (uint)lineBuffC.Count;
-
-				sourceTransform.CopyPixels(sourceRect, scaledWidth, scaledHeight, sourceTransformOptions, WICPlanarOptions.WICPlanarOptionsDefault, sourcePlanes, (uint)sourcePlanes.Length);
-				loadedY = sourceRect.Y + sourceRect.Height - scaledCrop.Y;
-				loadedC = (int)Math.Ceiling(loadedY / subsampleRatioY);
+				sourceTransform.CopyPixels(sourceRect, scaledWidth, scaledHeight, sourceTransformOptions, WICPlanarOptions.WICPlanarOptionsDefault, sourcePlanes, (uint)WicTransforms.PlanarPixelFormats.Length);
 			}
 		}
-
-		unsafe public void CopyPixels(WicPlane plane, in Rectangle prc, uint cbStride, uint cbBufferSize, IntPtr pbBuffer)
-		{
-			if ((plane == WicPlane.Luma && (prc.Y < startY || prc.Y > (startY + buffHeightY))) || (plane == WicPlane.Chroma && (prc.Y < startC || prc.Y > (startC + buffHeightC))))
-			{
-				startY = startC = -1;
-				loadedY = loadedC = -1;
-				nextY = nextC = 0;
-			}
-
-			if (lineBuffY.Array == null || (plane == WicPlane.Luma && prc.Y + prc.Height > loadedY) || (plane == WicPlane.Chroma && prc.Y + prc.Height > loadedC))
-				loadBuffer(plane, prc);
-
-			switch (plane)
-			{
-				case WicPlane.Luma:
-					fixed (byte* pBuffY = &lineBuffY.Array[0])
-					for (int y = 0; y < prc.Height; y++)
-						Buffer.MemoryCopy(pBuffY + (prc.Y - startY) * strideY + y * strideY + prc.X, (byte*)pbBuffer + y * cbStride, cbStride, prc.Width);
-					nextY = prc.Y + prc.Height - startY;
-					break;
-				case WicPlane.Chroma:
-					fixed (byte* pBuffC = &lineBuffC.Array[0])
-					for (int y = 0; y < prc.Height; y++)
-						Buffer.MemoryCopy(pBuffC + (prc.Y - startC) * strideC + y * strideC + prc.X * 2, (byte*)pbBuffer + y * cbStride, cbStride, prc.Width * 2);
-					nextC = prc.Y + prc.Height - startC;
-					break;
-			}
-		}
-
-		public PixelSource GetPlane(WicPlane plane) => plane == WicPlane.Luma ? sourceY : sourceC;
 
 		public void Dispose()
 		{
-			ArrayPool<byte>.Shared.Return(lineBuffY.Array ?? Array.Empty<byte>());
-			ArrayPool<byte>.Shared.Return(lineBuffC.Array ?? Array.Empty<byte>());
-			lineBuffY = lineBuffC = default;
+			ArrayPool<WICBitmapPlane>.Shared.TryReturn(sourcePlanes);
+			sourcePlanes = null!;
+
+			buffY.Dispose();
+			buffCb.Dispose();
+			buffCr.Dispose();
 		}
-	}
 
-	internal class PlanarPixelSource : PixelSource
-	{
-		private readonly WicPlanarCache cacheSource;
-		private readonly WicPlane cachePlane;
-
-		public PlanarPixelSource(WicPlanarCache cache, WicPlane plane, WICBitmapPlaneDescription planeDesc)
+		private sealed class PlanarCachePixelSource : PixelSource
 		{
-			Width = planeDesc.Width;
-			Height = planeDesc.Height;
-			Format = PixelFormat.Cache[planeDesc.Format];
-			WicSource = this.AsIWICBitmapSource();
+			private readonly WicPlanarCache cacheSource;
+			private readonly WicPlane cachePlane;
 
-			cacheSource = cache;
-			cachePlane = plane;
+			public override PixelFormat Format { get; }
+			public override int Width { get; }
+			public override int Height { get; }
+
+			public PlanarCachePixelSource(WicPlanarCache cache, WicPlane plane, WICBitmapPlaneDescription planeDesc) : base()
+			{
+				Format = PixelFormat.FromGuid(planeDesc.Format);
+				Width = (int)planeDesc.Width;
+				Height = (int)planeDesc.Height;
+
+				cacheSource = cache;
+				cachePlane = plane;
+			}
+
+			protected override void CopyPixelsInternal(in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer) =>
+				cacheSource.copyPixels(cachePlane, prc, cbStride, cbBufferSize, pbBuffer);
+
+			public override string ToString() => $"{nameof(PlanarCachePixelSource)}: {cachePlane}";
 		}
-
-		protected override void CopyPixelsInternal(in Rectangle prc, uint cbStride, uint cbBufferSize, IntPtr pbBuffer) =>
-			cacheSource.CopyPixels(cachePlane, prc, cbStride, cbBufferSize, pbBuffer);
-
-		public override string ToString() => $"{base.ToString()}: {cachePlane}";
 	}
 }

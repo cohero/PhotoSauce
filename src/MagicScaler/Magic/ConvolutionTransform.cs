@@ -1,13 +1,9 @@
 ﻿using System;
-using System.Buffers;
-using System.Drawing;
+using System.Diagnostics;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.Runtime.CompilerServices;
 
-using PhotoSauce.MagicScaler.Interop;
-
-namespace PhotoSauce.MagicScaler
+namespace PhotoSauce.MagicScaler.Transforms
 {
 	unsafe internal interface IConvolver
 	{
@@ -15,225 +11,274 @@ namespace PhotoSauce.MagicScaler
 		int MapChannels { get; }
 		void ConvolveSourceLine(byte* istart, byte* tstart, int cb, byte* mapxstart, int smapx, int smapy);
 		void WriteDestLine(byte* tstart, byte* ostart, int ox, int ow, byte* pmapy, int smapy);
-		void SharpenLine(byte* cstart, byte* ystart, byte* bstart, byte* ostart, int ox, int ow, int amt, int thresh, bool gamma);
+		void SharpenLine(byte* cstart, byte* ystart, byte* bstart, byte* ostart, int ox, int ow, float amt, float thresh, bool gamma);
 	}
 
-	internal class ConvolutionTransform<TPixel, TWeight> : PixelSource, IDisposable where TPixel : unmanaged where TWeight : unmanaged
+	internal interface IVectorConvolver
 	{
-		protected static readonly ReadOnlyDictionary<Guid, IConvolver> ProcessorMap = new ReadOnlyDictionary<Guid, IConvolver>(new Dictionary<Guid, IConvolver> {
-			[Consts.GUID_WICPixelFormat32bppCMYK          ] = new Convolver4ChanByte(),
-			[Consts.GUID_WICPixelFormat32bppPBGRA         ] = new Convolver4ChanByte(),
-			[Consts.GUID_WICPixelFormat32bppBGRA          ] = new ConvolverBgraByte(),
-			[Consts.GUID_WICPixelFormat24bppBGR           ] = new ConvolverBgrByte(),
-			[Consts.GUID_WICPixelFormat16bppCbCr          ] = new Convolver2ChanByte(),
-			[Consts.GUID_WICPixelFormat8bppGray           ] = new Convolver1ChanByte(),
-			[Consts.GUID_WICPixelFormat8bppY              ] = new Convolver1ChanByte(),
-			[PixelFormat.Pbgra64BppLinearUQ15.FormatGuid  ] = new Convolver4ChanUQ15(),
-			[PixelFormat.Bgr48BppLinearUQ15.FormatGuid    ] = new ConvolverBgrUQ15(),
-			[PixelFormat.Grey16BppLinearUQ15.FormatGuid   ] = new Convolver1ChanUQ15(),
-			[PixelFormat.Grey16BppUQ15.FormatGuid         ] = new Convolver1ChanUQ15(),
-			[PixelFormat.Y16BppLinearUQ15.FormatGuid      ] = new Convolver1ChanUQ15(),
-			[PixelFormat.Pbgra128BppLinearFloat.FormatGuid] = new Convolver4ChanFloat(),
-			[PixelFormat.Pbgra128BppFloat.FormatGuid      ] = new Convolver4ChanFloat(),
-			[PixelFormat.Bgrx128BppLinearFloat.FormatGuid ] = new Convolver3XChanFloat(),
-			[PixelFormat.Bgrx128BppFloat.FormatGuid       ] = new Convolver3XChanFloat(),
-			[PixelFormat.Bgr96BppLinearFloat.FormatGuid   ] = new Convolver3ChanFloat(),
-			[PixelFormat.Bgr96BppFloat.FormatGuid         ] = new Convolver3ChanFloat(),
-			[PixelFormat.CbCr64BppFloat.FormatGuid        ] = new Convolver2ChanFloat(),
-			[PixelFormat.Grey32BppLinearFloat.FormatGuid  ] = new Convolver1ChanFloat(),
-			[PixelFormat.Grey32BppFloat.FormatGuid        ] = new Convolver1ChanFloat(),
-			[PixelFormat.Y32BppLinearFloat.FormatGuid     ] = new Convolver1ChanFloat(),
-			[PixelFormat.Y32BppFloat.FormatGuid           ] = new Convolver1ChanFloat()
-		});
+		IConvolver IntrinsicImpl { get; }
+	}
 
-		protected readonly KernelMap<TWeight> XMap, YMap;
+	internal class ConvolutionTransform<TPixel, TWeight> : ChainedPixelSource, IDisposable where TPixel : unmanaged where TWeight : unmanaged
+	{
+		protected static readonly IReadOnlyDictionary<PixelFormat, IConvolver> ProcessorMap = new Dictionary<PixelFormat, IConvolver> {
+			[PixelFormat.Cmyk32Bpp             ] = Convolver4ChanByte.Instance,
+			[PixelFormat.Pbgra32Bpp            ] = Convolver4ChanByte.Instance,
+			[PixelFormat.Bgra32Bpp             ] = ConvolverBgraByte.Instance,
+			[PixelFormat.Bgr24Bpp              ] = ConvolverBgrByte.Instance,
+			[PixelFormat.Grey8Bpp              ] = Convolver1ChanByte.Instance,
+			[PixelFormat.Y8Bpp                 ] = Convolver1ChanByte.Instance,
+			[PixelFormat.Cb8Bpp                ] = Convolver1ChanByte.Instance,
+			[PixelFormat.Cr8Bpp                ] = Convolver1ChanByte.Instance,
+			[PixelFormat.Pbgra64BppLinearUQ15  ] = Convolver4ChanUQ15.Instance,
+			[PixelFormat.Bgr48BppLinearUQ15    ] = ConvolverBgrUQ15.Instance,
+			[PixelFormat.Grey16BppLinearUQ15   ] = Convolver1ChanUQ15.Instance,
+			[PixelFormat.Grey16BppUQ15         ] = Convolver1ChanUQ15.Instance,
+			[PixelFormat.Y16BppLinearUQ15      ] = Convolver1ChanUQ15.Instance,
+			[PixelFormat.Pbgra128BppLinearFloat] = Convolver4ChanVector.Instance,
+			[PixelFormat.Pbgra128BppFloat      ] = Convolver4ChanVector.Instance,
+			[PixelFormat.Bgrx128BppLinearFloat ] = Convolver4ChanVector.Instance,
+			[PixelFormat.Bgrx128BppFloat       ] = Convolver4ChanVector.Instance,
+			[PixelFormat.Bgr96BppLinearFloat   ] = Convolver3ChanVector.Instance,
+			[PixelFormat.Bgr96BppFloat         ] = Convolver3ChanVector.Instance,
+			[PixelFormat.Grey32BppLinearFloat  ] = Convolver1ChanVector.Instance,
+			[PixelFormat.Grey32BppFloat        ] = Convolver1ChanVector.Instance,
+			[PixelFormat.Y32BppLinearFloat     ] = Convolver1ChanVector.Instance,
+			[PixelFormat.Y32BppFloat           ] = Convolver1ChanVector.Instance,
+			[PixelFormat.Cb32BppFloat          ] = Convolver1ChanVector.Instance,
+			[PixelFormat.Cr32BppFloat          ] = Convolver1ChanVector.Instance
+		};
+
 		protected readonly IConvolver XProcessor, YProcessor;
+		protected readonly PixelBuffer IntBuff;
+		protected readonly PixelBuffer? SrcBuff, WorkBuff;
 
-		protected bool BufferSource;
-		protected int IntBpp;
-		protected int IntStride, WorkStride;
-		protected int IntStartLine;
-		protected Rectangle SourceRect;
-		protected ArraySegment<byte> LineBuff, WorkBuff, IntBuff;
+		protected KernelMap<TWeight> XMap, YMap;
 
-		public ConvolutionTransform(PixelSource source, KernelMap<TWeight> mapx, KernelMap<TWeight> mapy, bool lumaMode = false) : base(source)
+		private readonly bool bufferSource;
+
+		private ArraySegment<byte> lineBuff;
+
+		public override PixelFormat Format { get; }
+		public override int Width { get; }
+		public override int Height { get; }
+
+		public static ConvolutionTransform<TPixel, TWeight> CreateResize(PixelSource src, int width, int height, InterpolationSettings interpolatorx, InterpolationSettings interpolatory, bool offsetX, bool offsetY)
 		{
-			var fmt = Format;
+			var fmt = src.Format;
+			var mx = KernelMap<TWeight>.CreateResample(src.Width, width, interpolatorx, fmt.ChannelCount, offsetX);
+			var my = KernelMap<TWeight>.CreateResample(src.Height, height, interpolatory, fmt.ChannelCount == 3 ? 4 : fmt.ChannelCount, offsetY);
+
+			return new ConvolutionTransform<TPixel, TWeight>(src, mx, my);
+		}
+
+		public static ConvolutionTransform<TPixel, TWeight> CreateBlur(PixelSource src, double radius)
+		{
+			var fmt = src.Format;
+			var mx = KernelMap<TWeight>.CreateBlur(src.Width, radius, fmt.ChannelCount);
+			var my = KernelMap<TWeight>.CreateBlur(src.Height, radius, fmt.ChannelCount == 3 ? 4 : fmt.ChannelCount);
+
+			return new ConvolutionTransform<TPixel, TWeight>(src, mx, my);
+		}
+
+		protected ConvolutionTransform(PixelSource source, KernelMap<TWeight> mapx, KernelMap<TWeight> mapy, bool lumaMode = false) : base(source)
+		{
+			var infmt = source.Format;
+			var workfmt = infmt;
 			if (lumaMode)
 			{
-				if (fmt.ColorRepresentation == PixelColorRepresentation.Bgr || fmt.ColorRepresentation == PixelColorRepresentation.Grey)
-					fmt = fmt.NumericRepresentation == PixelNumericRepresentation.Float ? PixelFormat.Grey32BppFloat :
-					      fmt.NumericRepresentation == PixelNumericRepresentation.Fixed ? PixelFormat.Grey16BppUQ15 :
-					      fmt.NumericRepresentation == PixelNumericRepresentation.UnsignedInteger ? PixelFormat.Cache[Consts.GUID_WICPixelFormat8bppGray] :
-					      throw new NotSupportedException("Unsupported pixel format");
-				else
-					throw new NotSupportedException("Unsupported pixel format");
+				if (infmt.ColorRepresentation != PixelColorRepresentation.Grey && infmt.ColorRepresentation != PixelColorRepresentation.Bgr)
+					throw new NotSupportedException("Unsupported pixel format: " + infmt.Name);
+
+				workfmt = infmt.NumericRepresentation == PixelNumericRepresentation.Float ? PixelFormat.Grey32BppFloat :
+				          infmt.NumericRepresentation == PixelNumericRepresentation.Fixed ? PixelFormat.Grey16BppUQ15 :
+				          infmt.NumericRepresentation == PixelNumericRepresentation.UnsignedInteger ? PixelFormat.Grey8Bpp :
+				          throw new NotSupportedException("Unsupported pixel format: " + infmt.Name);
 			}
 
-			if (!ProcessorMap.TryGetValue(fmt.FormatGuid, out XProcessor))
-				throw new NotSupportedException("Unsupported pixel format");
+			if (!ProcessorMap.TryGetValue(workfmt, out XProcessor!))
+				throw new NotSupportedException("Unsupported pixel format: " + workfmt.Name);
 
-			if (fmt == PixelFormat.Bgr96BppLinearFloat)
-				Format = fmt = PixelFormat.Bgrx128BppLinearFloat;
-			else if (fmt == PixelFormat.Bgr96BppFloat)
-				Format = fmt = PixelFormat.Bgrx128BppFloat;
+			if (workfmt == PixelFormat.Bgr96BppLinearFloat)
+				Format = workfmt = PixelFormat.Bgrx128BppLinearFloat;
+			else if (workfmt == PixelFormat.Bgr96BppFloat)
+				Format = workfmt = PixelFormat.Bgrx128BppFloat;
+			else
+				Format = infmt;
 
-			YProcessor = ProcessorMap[fmt.FormatGuid];
+			YProcessor = ProcessorMap[workfmt];
+
+			if (HWIntrinsics.IsSupported && (mapx.Samples * mapx.Channels & 3) == 0 && XProcessor is IVectorConvolver vcx)
+				XProcessor = vcx.IntrinsicImpl;
+			if (HWIntrinsics.IsSupported && (mapy.Samples * mapy.Channels & 3) == 0 && YProcessor is IVectorConvolver vcy)
+				YProcessor = vcy.IntrinsicImpl;
+
 			XMap = mapx;
 			YMap = mapy;
 
 			if (XMap.Channels != XProcessor.MapChannels || YMap.Channels != YProcessor.MapChannels)
 				throw new NotSupportedException("Map and Processor channel counts don't match");
 
-			BufferSource = lumaMode;
-			SourceRect = new Rectangle { Width = (int)Width, Height = 1 };
-			IntStartLine = -mapy.Samples;
+			Width = mapx.Pixels;
+			Height = mapy.Pixels;
 
-			IntBpp = fmt.BitsPerPixel / 8 / Unsafe.SizeOf<TPixel>() * Unsafe.SizeOf<TWeight>();
-			IntStride = mapy.Samples * IntBpp;
-			WorkStride = fmt.BitsPerPixel / 8 * (int)Width + (IntPtr.Size - 1) & ~(IntPtr.Size - 1);
+			int bpp = workfmt.BytesPerPixel / Unsafe.SizeOf<TPixel>() * Unsafe.SizeOf<TWeight>();
+			IntBuff = new PixelBuffer(mapy.Samples, bpp, true, mapy.Samples * mapx.Pixels * bpp);
 
-			int lineBuffLen = (BufferSource ? mapy.Samples : 1) * (int)BufferStride;
-			int intBuffLen = mapx.OutPixels * IntStride;
-			int workBuffLen = mapy.Samples * WorkStride;
-			LineBuff = new ArraySegment<byte>(ArrayPool<byte>.Shared.Rent(lineBuffLen), 0, lineBuffLen).Zero();
-			IntBuff = new ArraySegment<byte>(ArrayPool<byte>.Shared.Rent(intBuffLen), 0, intBuffLen).Zero();
-			WorkBuff = lumaMode && !Format.IsBinaryCompatibleWith(fmt) ? new ArraySegment<byte>(ArrayPool<byte>.Shared.Rent(workBuffLen), 0, workBuffLen).Zero() : LineBuff;
+			if (bufferSource = lumaMode)
+			{
+				SrcBuff = new PixelBuffer(mapy.Samples, BufferStride, true);
 
-			Width = (uint)mapx.OutPixels;
-			Height = (uint)mapy.OutPixels;
+				if (workfmt.IsBinaryCompatibleWith(infmt))
+					WorkBuff = SrcBuff;
+				else
+					WorkBuff = new PixelBuffer(mapy.Samples, MathUtil.PowerOfTwoCeiling(source.Width * workfmt.BytesPerPixel, IntPtr.Size), true);
+			}
+			else
+			{
+				lineBuff = BufferPool.Rent(BufferStride, true);
+			}
 		}
 
-		unsafe protected override void CopyPixelsInternal(in Rectangle prc, uint cbStride, uint cbBufferSize, IntPtr pbBuffer)
+		unsafe protected override void CopyPixelsInternal(in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer)
 		{
-			fixed (byte* bstart = &LineBuff.Array[0], wstart = &WorkBuff.Array[0], tstart = &IntBuff.Array[0])
-			fixed (byte* mapxstart = &XMap.Map.Array[0], mapystart = &YMap.Map.Array[0])
+			if (XMap is null)
+				throw new ObjectDisposedException(nameof(ConvolutionTransform<TPixel, TWeight>));
+
+			fixed (byte* mapystart = YMap.Map)
 			{
 				int oh = prc.Height, ow = prc.Width, ox = prc.X, oy = prc.Y;
 				int smapy = YMap.Samples, chan = YMap.Channels;
 
 				for (int y = 0; y < oh; y++)
 				{
-					int* pmapy = (int*)mapystart + ((oy + y) * (smapy * chan + 1));
+					int* pmapy = (int*)mapystart + ((oy + y) * (typeof(TWeight) == typeof(float) ? 2 : (smapy * chan + 1)));
 					int iy = *pmapy++;
-					LoadBuffer(bstart, wstart, tstart, mapxstart, iy);
+					if (typeof(TWeight) == typeof(float))
+						pmapy = (int*)(mapystart + *pmapy);
 
-					byte* op = (byte*)pbBuffer + y * cbStride;
-					ConvolveLine(bstart, wstart, tstart, op, (byte*)pmapy, smapy, ox, oy + y, ow);
+					if (!IntBuff.ContainsRange(iy, smapy))
+						loadBuffer(iy, smapy);
+
+					ConvolveLine((byte*)pbBuffer + y * cbStride, (byte*)pmapy, smapy, iy, oy + y, ox, ow);
 				}
 			}
 		}
 
-		unsafe protected virtual void ConvolveLine(byte* bstart, byte* wstart, byte* tstart, byte* ostart, byte* pmapy, int smapy, int ox, int oy, int ow) =>
-			YProcessor.WriteDestLine(tstart, ostart, ox, ow, pmapy, smapy);
-
-		unsafe protected void LoadBuffer(byte* bstart, byte* wstart, byte* tstart, byte* mapxstart, int iy)
+		protected override void Reset()
 		{
-			int smapy = YMap.Samples;
+			IntBuff.Reset();
+			SrcBuff?.Reset();
+			WorkBuff?.Reset();
+		}
 
-			if (iy < IntStartLine)
-				IntStartLine = iy - smapy;
+		unsafe private void loadBuffer(int first, int lines)
+		{
+			Debug.Assert((!bufferSource && lineBuff.Array is not null) || (WorkBuff is not null && SrcBuff is not null));
 
-			int tc = Math.Min(iy - IntStartLine, smapy);
-			if (tc <= 0)
-				return;
-
-			IntStartLine = iy;
-
-			int tk = smapy - tc;
-			if (tk > 0)
+			fixed (byte* mapxstart = XMap.Map)
 			{
-				if (BufferSource)
+				int fli = first, cli = lines;
+				var ispan = IntBuff.PrepareLoad(ref fli, ref cli);
+
+				int flb = first, clb = lines;
+				var bspan = bufferSource ? SrcBuff!.PrepareLoad(ref flb, ref clb) : lineBuff.AsSpan();
+
+				int flw = first, clw = lines;
+				var wspan = bufferSource && WorkBuff != SrcBuff ? WorkBuff!.PrepareLoad(ref flw, ref clw) : bspan;
+
+				fixed (byte* bline = bspan, wline = wspan, tline = ispan)
 				{
-					Buffer.MemoryCopy(bstart + tc * BufferStride, bstart, LineBuff.Array.Length, tk * BufferStride);
-					if (WorkBuff.Array != LineBuff.Array)
-						Buffer.MemoryCopy(wstart + tc * WorkStride, wstart, WorkBuff.Array.Length, tk * WorkStride);
-				}
-
-				Buffer.MemoryCopy(tstart + tc * IntBpp, tstart, IntBuff.Array.Length, IntBuff.Count - tc * IntBpp);
-			}
-
-			for (int ty = tk; ty < smapy; ty++)
-			{
-				byte* bline = BufferSource ? bstart + ty * BufferStride : bstart;
-				byte* wline = BufferSource ? wstart + ty * WorkStride : bstart;
-
-				SourceRect.Y = iy + ty;
-				Timer.Stop();
-				Source.CopyPixels(SourceRect, BufferStride, BufferStride, (IntPtr)bline);
-				Timer.Start();
-
-				if (BufferSource)
-				{
-					if (Format == PixelFormat.Grey32BppLinearFloat || Format == PixelFormat.Y32BppLinearFloat)
-						GreyConverter.ConvertGreyLinearToGreyFloat(bline, wline, (int)BufferStride);
-					else if (Format == PixelFormat.Grey16BppLinearUQ15 || Format == PixelFormat.Y16BppLinearUQ15)
-						GreyConverter.ConvertGreyLinearToGreyUQ15(bline, wline, (int)BufferStride);
-					else if (Format.FormatGuid == Consts.GUID_WICPixelFormat24bppBGR)
-						GreyConverter.ConvertBgrToGreyByte(bline, wline, (int)BufferStride);
-					else if (Format == PixelFormat.Bgr48BppLinearUQ15)
-						GreyConverter.ConvertBgrToGreyUQ15(bline, wline, (int)BufferStride);
-					else if (Format.FormatGuid == Consts.GUID_WICPixelFormat32bppBGR || Format.FormatGuid == Consts.GUID_WICPixelFormat32bppBGRA || Format.FormatGuid == Consts.GUID_WICPixelFormat32bppPBGRA)
-						GreyConverter.ConvertBgrxToGreyByte(bline, wline, (int)BufferStride);
-					else if (Format == PixelFormat.Pbgra64BppLinearUQ15)
-						GreyConverter.ConvertBgrxToGreyUQ15(bline, wline, (int)BufferStride);
-					else if (Format == PixelFormat.Bgr96BppFloat)
-						GreyConverter.ConvertBgrToGreyFloat(bline, wline, (int)BufferStride, false);
-					else if (Format == PixelFormat.Bgrx128BppFloat || Format == PixelFormat.Pbgra128BppFloat)
-						GreyConverter.ConvertBgrxToGreyFloat(bline, wline, (int)BufferStride, false);
-					else if (Format == PixelFormat.Bgr96BppLinearFloat)
+					byte* bp = bline, wp = wline, tp = tline;
+					for (int ly = 0; ly < cli; ly++)
 					{
-						GreyConverter.ConvertBgrToGreyFloat(bline, wline, (int)BufferStride, true);
-						GreyConverter.ConvertGreyLinearToGreyFloat(wline, wline, WorkStride);
-					}
-					else if (Format == PixelFormat.Bgrx128BppLinearFloat || Format == PixelFormat.Pbgra128BppLinearFloat)
-					{
-						GreyConverter.ConvertBgrxToGreyFloat(bline, wline, (int)BufferStride, true);
-						GreyConverter.ConvertGreyLinearToGreyFloat(wline, wline, WorkStride);
+						Profiler.PauseTiming();
+						PrevSource.CopyPixels(new PixelArea(0, fli + ly, PrevSource.Width, 1), bspan.Length, bspan.Length, (IntPtr)bp);
+						Profiler.ResumeTiming();
+
+						if (bp != wp)
+							GreyConverter.ConvertLine(Format, bp, wp, SrcBuff!.Stride, WorkBuff!.Stride);
+
+						XProcessor.ConvolveSourceLine(wp, tp, ispan.Length - ly * IntBuff.Stride, mapxstart, XMap.Samples, lines);
+
+						tp += IntBuff.Stride;
+
+						if (bufferSource)
+						{
+							wp += WorkBuff!.Stride;
+							bp += SrcBuff!.Stride;
+						}
 					}
 				}
-
-				byte* tline = tstart + ty * IntBpp;
-				XProcessor.ConvolveSourceLine(wline, tline, IntBuff.Count, mapxstart, XMap.Samples, smapy);
 			}
+		}
+
+		unsafe protected virtual void ConvolveLine(byte* ostart, byte* pmapy, int smapy, int iy, int oy, int ox, int ow)
+		{
+			fixed (byte* tstart = IntBuff.PrepareRead(iy, smapy))
+				YProcessor.WriteDestLine(tstart, ostart, ox, ow, pmapy, smapy);
 		}
 
 		public virtual void Dispose()
 		{
-			ArrayPool<byte>.Shared.Return(LineBuff.Array ?? Array.Empty<byte>());
-			ArrayPool<byte>.Shared.Return(IntBuff.Array ?? Array.Empty<byte>());
-			if (WorkBuff.Array != LineBuff.Array)
-				ArrayPool<byte>.Shared.Return(WorkBuff.Array ?? Array.Empty<byte>());
+			if (XMap is null)
+				return;
 
-			LineBuff = WorkBuff = IntBuff = default;
+			XMap.Dispose();
+			YMap.Dispose();
+			XMap = null!;
+			YMap = null!;
+
+			IntBuff.Dispose();
+			SrcBuff?.Dispose();
+			WorkBuff?.Dispose();
+
+			BufferPool.Return(lineBuff);
+			lineBuff = default;
 		}
 
-		public override string ToString() => XProcessor?.ToString() ?? base.ToString();
+		public override string? ToString() => $"{XProcessor}: {Format.Name}";
 	}
 
-	internal class UnsharpMaskTransform<TPixel, TWeight> : ConvolutionTransform<TPixel, TWeight> where TPixel : unmanaged where TWeight : unmanaged
+	internal sealed class UnsharpMaskTransform<TPixel, TWeight> : ConvolutionTransform<TPixel, TWeight> where TPixel : unmanaged where TWeight : unmanaged
 	{
-		private UnsharpMaskSettings sharpenSettings;
-		private ArraySegment<byte> blurBuff;
-		private IConvolver processor;
+		private readonly IConvolver processor;
+		private readonly float amount, threshold;
 
-		public UnsharpMaskTransform(PixelSource source, KernelMap<TWeight> mapx, KernelMap<TWeight> mapy, UnsharpMaskSettings ss) : base(source, mapx, mapy, true)
+		private ArraySegment<byte> blurBuff;
+
+		public static UnsharpMaskTransform<TPixel, TWeight> CreateSharpen(PixelSource src, UnsharpMaskSettings sharp)
 		{
-			sharpenSettings = ss;
-			processor = ProcessorMap[Format.FormatGuid];
-			blurBuff = new ArraySegment<byte>(ArrayPool<byte>.Shared.Rent(WorkStride), 0, WorkStride);
+			var mx = KernelMap<TWeight>.CreateBlur(src.Width, sharp.Radius, 1);
+			var my = KernelMap<TWeight>.CreateBlur(src.Height, sharp.Radius, 1);
+
+			return new UnsharpMaskTransform<TPixel, TWeight>(src, mx, my, sharp);
 		}
 
-		unsafe protected override void ConvolveLine(byte* bstart, byte* wstart, byte* tstart, byte* ostart, byte* pmapy, int smapy, int ox, int oy, int ow)
+		private UnsharpMaskTransform(PixelSource source, KernelMap<TWeight> mapx, KernelMap<TWeight> mapy, UnsharpMaskSettings ss) : base(source, mapx, mapy, true)
 		{
-			fixed (byte* blurstart = &blurBuff.Array[0])
-			{
-				int cy = oy - IntStartLine;
-				byte* bp = bstart + cy * BufferStride;
-				byte* wp = wstart + cy * WorkStride;
+			Debug.Assert(SrcBuff is not null && WorkBuff is not null);
 
+			processor = ProcessorMap[Format];
+			if (HWIntrinsics.IsSupported && processor is IVectorConvolver vc)
+				processor = vc.IntrinsicImpl;
+
+			amount = ss.Amount * 0.01f;
+			threshold = (float)ss.Threshold / byte.MaxValue;
+
+			blurBuff = BufferPool.Rent(WorkBuff.Stride, true);
+		}
+
+		unsafe protected override void ConvolveLine(byte* ostart, byte* pmapy, int smapy, int iy, int oy, int ox, int ow)
+		{
+			var bspan = SrcBuff!.PrepareRead(oy, 1);
+			var wspan = WorkBuff != SrcBuff ? WorkBuff!.PrepareRead(oy, 1) : bspan;
+			var tspan = IntBuff.PrepareRead(iy, smapy);
+
+			fixed (byte* bstart = bspan, wstart = wspan, tstart = tspan, blurstart = blurBuff.AsSpan())
+			{
 				YProcessor.WriteDestLine(tstart, blurstart, ox, ow, pmapy, smapy);
-				processor.SharpenLine(bp, wp, blurstart, ostart, ox, ow, sharpenSettings.Amount, sharpenSettings.Threshold, Format.Colorspace == PixelColorspace.LinearRgb);
+				processor.SharpenLine(bstart, wstart, blurstart, ostart, ox, ow, amount, threshold, Format.Encoding == PixelValueEncoding.Linear);
 			}
 		}
 
@@ -241,10 +286,10 @@ namespace PhotoSauce.MagicScaler
 		{
 			base.Dispose();
 
-			ArrayPool<byte>.Shared.Return(blurBuff.Array ?? Array.Empty<byte>());
+			BufferPool.Return(blurBuff);
 			blurBuff = default;
 		}
 
-		public override string ToString() => $"{processor?.ToString() ?? base.ToString()}: Sharpen";
+		public override string ToString() => $"{processor}: Sharpen";
 	}
 }

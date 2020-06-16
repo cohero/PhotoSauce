@@ -1,143 +1,30 @@
 ﻿using System;
-using System.IO;
 using System.Linq;
 using System.Drawing;
-using System.Diagnostics;
-using System.Text;
-using System.Text.RegularExpressions;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 
-#if DRAWING_SHIM_COLOR || DRAWING_SHIM_COLORCONVERTER
-using System.Drawing.ColorShim;
-#endif
-
+using Blake2Fast;
 using PhotoSauce.MagicScaler.Interpolators;
 
 namespace PhotoSauce.MagicScaler
 {
-	/// <summary>Defines the horizontal and vertical anchor positions for auto cropping.</summary>
-	[Flags]
-	public enum CropAnchor
-	{
-		/// <summary>Crop to the image center.</summary>
-		Center = 0,
-		/// <summary>Preserve the top edge of the image.</summary>
-		Top = 1,
-		/// <summary>Preserve the bottom edge of the image.</summary>
-		Bottom = 2,
-		/// <summary>Preserve the left edge of the image.</summary>
-		Left = 4,
-		/// <summary>Preserve the right edge of the image.</summary>
-		Right = 8
-	}
-
-	/// <summary>Defines the modes for auto cropping and scaling.</summary>
-	public enum CropScaleMode
-	{
-		/// <summary>Preserve the aspect ratio of the input image.  Crop if necessary to fit the output dimensions.</summary>
-		Crop,
-		/// <summary>Preserve the aspect ratio of the input image.  Reduce one of the output dimensions if necessary to preserve the ratio.</summary>
-		Max,
-		/// <summary>Stretch the image on one axis if necessary to fill the output dimensions.</summary>
-		Stretch,
-		/// <summary>Preserve the aspect ratio of the input image.  Fill any undefined pixels with the <see cref="ProcessImageSettings.MatteColor" />.</summary>
-		Pad
-	}
-
-	/// <summary>Defines the modes that control speed vs. quality trade-offs for high-ratio scaling operations.</summary>
-	public enum HybridScaleMode
-	{
-		/// <summary>Allow lower-quality downscaling to a size at least 3x the target size.  Use high-quality scaling to reach the final size.</summary>
-		FavorQuality,
-		/// <summary>Allow lower-quality downscaling to a size at least 2x the target size.  Use high-quality scaling to reach the final size.</summary>
-		FavorSpeed,
-		/// <summary>Allow lower-quality downscaling to the nearest power of 2 to the target size.  Use high-quality scaling to reach the final size.</summary>
-		Turbo,
-		/// <summary>Do not allow hybrid scaling.  Use the high-quality scaler exclusively.</summary>
-		Off
-	}
-
-	/// <summary>Defines the modes that control <a href="http://blog.johnnovak.net/2016/09/21/what-every-coder-should-know-about-gamma/">gamma correction</a> in pixel blending.</summary>
-	public enum GammaMode
-	{
-		/// <summary>Convert values to linear RGB before blending.</summary>
-		Linear,
-		/// <summary>Blend gamma-companded R'G'B' values directly.</summary>
-		Companded,
-		/// <summary>Same as <see cref="Companded" />.</summary>
-		[Obsolete("Use GammaMode.Companded instead")]
-		sRGB = 1
-	}
-
-	/// <summary>Defines the modes that control <a href="https://en.wikipedia.org/wiki/Chroma_subsampling">chroma subsampling</a> for output image formats that support it.</summary>
-	public enum ChromaSubsampleMode
-	{
-		/// <summary>Configured subsampling automatically based on output format and quality settings.</summary>
-		Default = 0,
-		/// <summary>Use 4:2:0 Y'CbCr subsampling.</summary>
-		Subsample420 = 1,
-		/// <summary>Use 4:2:2 Y'CbCr subsampling.</summary>
-		Subsample422 = 2,
-		/// <summary>Do not use chroma subsampling (4:4:4).</summary>
-		Subsample444 = 3
-	}
-
-	/// <summary>Defines known image container formats for auto-detection and output configuration.</summary>
-	public enum FileFormat
-	{
-		/// <summary>Set output container format automatically based on input format and image contents.</summary>
-		Auto,
-		/// <summary>A JPEG container.</summary>
-		Jpeg,
-		/// <summary>A PNG container.</summary>
-		Png,
-		/// <summary>A PNG container using an 8-bit indexed pixel format.</summary>
-		Png8,
-		/// <summary>A GIF container.</summary>
-		Gif,
-		/// <summary>A BMP container.</summary>
-		Bmp,
-		/// <summary>A TIFF container.</summary>
-		Tiff,
-		/// <summary>An unrecognized but still decodable image container.</summary>
-		Unknown = Auto
-	}
-
-	/// <summary>Defines the modes that control <a href="https://magnushoff.com/jpeg-orientation.html">Exif Orientation</a> correction.</summary>
-	public enum OrientationMode
-	{
-		/// <summary>Correct the image orientation according to the Exif tag on load.  Save the output in normal orientation.</summary>
-		Normalize,
-		/// <summary>Preserve the orientation of the input image and tag the output image to reflect the orientation.  If the output format does not support orientation tagging, it will be discarded.</summary>
-		Preserve,
-		/// <summary>Ignore any orientation tag and treat the image as if its stored orientation is normal.  Do not tag the output image.</summary>
-		Ignore = 0xff
-	}
-
-	/// <summary>Defines the modes that control <a href="https://en.wikipedia.org/wiki/ICC_profile">ICC Color Profile</a> handling.</summary>
-	public enum ColorProfileMode
-	{
-		/// <summary>Convert the input image to the <a href="https://en.wikipedia.org/wiki/SRGB">sRGB color space</a> during processing.  Output an untagged sRGB image.</summary>
-		Normalize,
-		/// <summary>Convert the input image to the <a href="https://en.wikipedia.org/wiki/SRGB">sRGB color space</a> during processing.  Embed a compact sRGB profile in the output.</summary>
-		NormalizeAndEmbed,
-		/// <summary>Preserve the input image color space during processing.  Embed the ICC profile in the output image.  If the output format does not support embedded profiles, it will be discarded.</summary>
-		Preserve,
-		/// <summary>Ignore any embedded profiles and treat the image as <a href="https://en.wikipedia.org/wiki/SRGB">sRGB</a> data.  Do not tag the output image.</summary>
-		Ignore = 0xff
-	}
-
 	/// <summary>Defines settings for an <a href="https://en.wikipedia.org/wiki/Unsharp_masking">Unsharp Masking</a> operation.</summary>
+	/// <remarks>These settings are designed to function similarly to the Unsharp Mask settings in Photoshop.</remarks>
 	public readonly struct UnsharpMaskSettings
 	{
 		/// <summary>No sharpening.</summary>
 		public static readonly UnsharpMaskSettings None = default;
 
 		/// <summary>The amount of sharpening.  This value represents a percentage of the difference between the blurred image and the original image.</summary>
+		/// <value>Typical values are between <c>25</c> and <c>200</c>.</value>
 		public int Amount { get; }
 		/// <summary>The radius (sigma) of the gaussian blur used for the mask.  This value determines the size of details that are sharpened.</summary>
+		/// <value>Typical values are between <c>0.3</c> and <c>3.0</c>. Larger radius values can have significant performance cost.</value>
 		public double Radius { get; }
 		/// <summary>The minimum brightness change required for a pixel to be modified by the filter.</summary>
+		/// <remarks>When using larger <see cref="Radius"/> or <see cref="Amount"/> values, a larger <see cref="Threshold"/> value can ensure lines are sharpened while textures are not.</remarks>
+		/// <value>Typical values are between <c>0</c> and <c>10</c>.</value>
 		public byte Threshold { get; }
 
 		/// <summary>Constructs a new <see cref="UnsharpMaskSettings" /> instance with the specified values.</summary>
@@ -155,38 +42,39 @@ namespace PhotoSauce.MagicScaler
 	/// <summary>Defines settings for resampling interpolation.</summary>
 	public readonly struct InterpolationSettings
 	{
-		/// <summary>A predefined Nearest Neighbor interpolator.</summary>
+		/// <summary>A predefined <see cref="PointInterpolator" />.</summary>
 		public static readonly InterpolationSettings NearestNeighbor = new InterpolationSettings(new PointInterpolator());
-		/// <summary>A predefined Averaging (Box) interpolator.</summary>
+		/// <summary>A predefined <see cref="BoxInterpolator" />.</summary>
 		public static readonly InterpolationSettings Average = new InterpolationSettings(new BoxInterpolator());
-		/// <summary>A predefined Linear (Bilinear) interpolator.</summary>
+		/// <summary>A predefined <see cref="LinearInterpolator" />.  Also known as Bilinear in some software.</summary>
 		public static readonly InterpolationSettings Linear = new InterpolationSettings(new LinearInterpolator());
-		/// <summary>A predefined Hermite (b=0, c=0) Cubic interpolator.</summary>
+		/// <summary>A predefined Hermite (b=0, c=0) <see cref="CubicInterpolator" />.</summary>
 		public static readonly InterpolationSettings Hermite = new InterpolationSettings(new CubicInterpolator(0d, 0d));
-		/// <summary>A predefined Quadratic interpolator with properties similar to a Catmull-Rom Cubic.</summary>
+		/// <summary>A predefined <see cref="QuadraticInterpolator" /> with properties similar to a Catmull-Rom Cubic.</summary>
 		public static readonly InterpolationSettings Quadratic = new InterpolationSettings(new QuadraticInterpolator());
 		/// <summary>A predefined Mitchell-Netravali (b=1/3, c=1/3) Cubic interpolator.</summary>
 		public static readonly InterpolationSettings Mitchell = new InterpolationSettings(new CubicInterpolator(1d/3d, 1d/3d));
-		/// <summary>A predefined Catmull-Rom (b=0, c=1/2) Cubic interpolator.</summary>
+		/// <summary>A predefined Catmull-Rom (b=0, c=1/2) <see cref="CubicInterpolator" />.</summary>
 		public static readonly InterpolationSettings CatmullRom = new InterpolationSettings(new CubicInterpolator());
-		/// <summary>A predefined Cardinal (b=0, c=1) Cubic interpolator.</summary>
+		/// <summary>A predefined Cardinal (b=0, c=1) <see cref="CubicInterpolator" />.  Also known as Bicubic in some software.</summary>
 		public static readonly InterpolationSettings Cubic = new InterpolationSettings(new CubicInterpolator(0d, 1d));
-		/// <summary>A predefined smoothing Cubic interpolator.  Similar to Photoshop's "Bicubic Smoother".</summary>
+		/// <summary>A predefined smoothing <see cref="CubicInterpolator" />.  Similar to Photoshop's "Bicubic Smoother".</summary>
 		public static readonly InterpolationSettings CubicSmoother = new InterpolationSettings(new CubicInterpolator(0d, 0.625), 1.15);
-		/// <summary>A predefined 3-lobed Lanczos interpolator.</summary>
+		/// <summary>A predefined 3-lobed <see cref="LanczosInterpolator" />.</summary>
 		public static readonly InterpolationSettings Lanczos = new InterpolationSettings(new LanczosInterpolator());
-		/// <summary>A predefined Spline 36 interpolator.</summary>
+		/// <summary>A predefined <see cref="Spline36Interpolator" />.</summary>
 		public static readonly InterpolationSettings Spline36 = new InterpolationSettings(new Spline36Interpolator());
 
 		private readonly double blur;
 
-		/// <summary>A blur value stretches or compresses the input window of an interpolation function.  This value represents a fraction of the normal window size, with 1.0 being normal.</summary>
+		/// <summary>A blur value stretches or compresses the input window of an interpolation function.  This value represents a fraction of the normal window size, with <c>1.0</c> being normal.</summary>
+		/// <value>Supported values: <c>0.5</c> to <c>1.5</c>.  Values less than <c>1.0</c> can cause unpleasant artifacts.</value>
 		public double Blur => WeightingFunction is null ? default : WeightingFunction.Support * blur < 0.5 ? 1d : blur;
 
 		/// <summary>An <see cref="IInterpolator" /> implementation that provides interpolated sample weights.</summary>
 		public IInterpolator WeightingFunction { get; }
 
-		/// <inheritdoc cref="InterpolationSettings(IInterpolator, Double)" />
+		/// <inheritdoc cref="InterpolationSettings(IInterpolator, double)" />
 		public InterpolationSettings(IInterpolator weighting) : this(weighting, 1d) { }
 
 		/// <summary>Constructs a new <see cref="InterpolationSettings" /> instance with the specified values.</summary>
@@ -204,107 +92,148 @@ namespace PhotoSauce.MagicScaler
 	/// <summary>Defines settings for a <see cref="MagicImageProcessor" /> pipeline operation.</summary>
 	public sealed class ProcessImageSettings
 	{
-		private static readonly Lazy<Regex> cropExpression = new Lazy<Regex>(() => new Regex(@"^(\d+,){3}\d+$", RegexOptions.Compiled));
+		private static readonly Lazy<Regex> cropExpression = new Lazy<Regex>(() => new Regex(@"^(\d+,){2}-?\d+,-?\d+$", RegexOptions.Compiled));
+		private static readonly Lazy<Regex> cropBasisExpression = new Lazy<Regex>(() => new Regex(@"^\d+,\d+$", RegexOptions.Compiled));
 		private static readonly Lazy<Regex> anchorExpression = new Lazy<Regex>(() => new Regex(@"^(top|middle|bottom)?\-?(left|center|right)?$", RegexOptions.Compiled | RegexOptions.IgnoreCase));
 		private static readonly Lazy<Regex> subsampleExpression = new Lazy<Regex>(() => new Regex(@"^4(20|22|44)$", RegexOptions.Compiled));
-		private static readonly Lazy<Regex> hexColorExpression = new Lazy<Regex>(() => new Regex(@"^[0-9A-Fa-f]{6}$", RegexOptions.Compiled));
 		private static readonly ProcessImageSettings empty = new ProcessImageSettings();
 
 		private InterpolationSettings interpolation;
 		private UnsharpMaskSettings unsharpMask;
 		private int jpegQuality;
 		private ChromaSubsampleMode jpegSubsampling;
-		private ImageFileInfo imageInfo;
-		internal Rectangle InnerRect;
-		internal Rectangle OuterRect;
+		private ImageFileInfo? imageInfo;
+		internal Size InnerSize;
+		internal Size OuterSize;
+		internal bool AutoCrop;
 
-		/// <summary>The 0-based index of the image frame to process from within the container.</summary>
-		public int FrameIndex { get; set; }
-		/// <summary>The horizontal DPI of the output image.  This affects the image metadata only.</summary>
-		public double DpiX { get; set; } = 96d;
-		/// <summary>The vertical DPI of the output image.  This affects the image metadata only.</summary>
-		public double DpiY { get; set; } = 96d;
-		/// <summary>Determines whether automatic sharpening is applied during processing.</summary>
-		public bool Sharpen { get; set; } = true;
-		/// <summary>Determines how automatic scaling and cropping is performed.</summary>
-		public CropScaleMode ResizeMode { get; set; }
-		/// <summary>Defines the bounding rectangle to use from the input image.  Can be calculated automatically depending on <see cref="CropScaleMode" />.</summary>
-		public Rectangle Crop { get; set; }
-		/// <summary>Determines which part of the image is preserved when automatic cropping is performed.</summary>
-		public CropAnchor Anchor { get; set; }
-		/// <summary>Determines the container format of the output image.</summary>
-		public FileFormat SaveFormat { get; set; }
-		/// <summary>The background color to use when converting to a non-transparent format and the fill color for <see cref="CropScaleMode.Pad" /> mode.</summary>
-		public Color MatteColor { get; set; }
-		/// <summary>Determines whether Hybrid Scaling is allowed to be used to improve performance.</summary>
-		public HybridScaleMode HybridMode { get; set; }
-		/// <summary>Determines whether pixel blending is done using linear RGB or gamma-companded R'G'B'.</summary>
-		public GammaMode BlendingMode { get; set; }
-		/// <summary>Determines whether automatic orientation correction is performed.</summary>
-		public OrientationMode OrientationMode { get; set; }
-		/// <summary>Determines whether automatic colorspace conversion is performed.</summary>
-		public ColorProfileMode ColorProfileMode { get; set; }
-		/// <summary>A list of <a href="https://docs.microsoft.com/en-us/windows/desktop/wic/photo-metadata-policies">Windows Photo Metadata Policy</a> names.  Any values matching the included policies will be copied to the output image if supported.</summary>
-		public IEnumerable<string> MetadataNames { get; set; }
+		internal bool IndexedColor => SaveFormat == FileFormat.Png8 || SaveFormat == FileFormat.Gif;
 
-		internal bool Normalized => imageInfo != null;
+		internal bool IsNormalized => imageInfo is not null;
 
 		internal bool IsEmpty =>
-			OuterRect       == empty.OuterRect       &&
+			OuterSize       == empty.OuterSize       &&
 			jpegQuality     == empty.jpegQuality     &&
 			jpegSubsampling == empty.jpegSubsampling &&
 			FrameIndex      == empty.FrameIndex      &&
 			DpiX            == empty.DpiX            &&
 			DpiY            == empty.DpiY            &&
 			Crop            == empty.Crop            &&
+			CropBasis       == empty.CropBasis       &&
 			SaveFormat      == empty.SaveFormat      &&
 			MatteColor      == empty.MatteColor      &&
 			unsharpMask.Equals(empty.unsharpMask)
 		;
 
-		/// <summary>The width of the output image in pixels.</summary>
+		internal Rectangle InnerRect => new Rectangle {
+			X = (OuterSize.Width - InnerSize.Width) / 2,
+			Y = (OuterSize.Height - InnerSize.Height) / 2,
+			Width = InnerSize.Width,
+			Height = InnerSize.Height
+		};
+
+		internal double ScaleRatio =>
+			Math.Min(InnerSize.Width > 0 ? (double)Crop.Width / InnerSize.Width : 0d, InnerSize.Height > 0 ? (double)Crop.Height / InnerSize.Height : 0d);
+
+		/// <summary>The 0-based index of the image frame to process from within the container.</summary>
+		/// <value>Default value: <c>0</c></value>
+		public int FrameIndex { get; set; }
+		/// <summary>The horizontal DPI of the output image.  A value of <c>0</c> will preserve the DPI of the input image.</summary>
+		/// <remarks>This affects the image metadata only.  Not all image formats support a DPI setting and most applications will ignore it.</remarks>
+		/// <value>Default value: <c>96</c></value>
+		public double DpiX { get; set; } = 96d;
+		/// <summary>The vertical DPI of the output image.  A value of <c>0</c> will preserve the DPI of the input image.</summary>
+		/// <remarks>This affects the image metadata only.  Not all image formats support a DPI setting and most applications will ignore it.</remarks>
+		/// <value>Default value: <c>96</c></value>
+		public double DpiY { get; set; } = 96d;
+		/// <summary>Determines whether automatic sharpening is applied during processing.  The sharpening settings are controlled by the <see cref="UnsharpMask"/> property.</summary>
+		/// <value>Default value: <c>true</c></value>
+		public bool Sharpen { get; set; } = true;
+		/// <summary>Determines how automatic scaling and cropping is performed.</summary>
+		/// <remarks>Auto-cropping is performed only if a <see cref="Crop" /> value is not explicitly set.</remarks>
+		/// <value>Default value: <see cref="CropScaleMode.Crop" /></value>
+		public CropScaleMode ResizeMode { get; set; }
+		/// <summary>Defines the bounding rectangle to use from the input image.  Can be calculated automatically depending on <see cref="CropScaleMode" />.</summary>
+		/// <include file='Docs/Remarks.xml' path='doc/member[@name="Crop"]/*'/>
+		/// <value>Default value: <see cref="Rectangle.Empty" /></value>
+		public Rectangle Crop { get; set; }
+		/// <summary>Defines the dimensions on which the <see cref="Crop" /> rectangle is based.  If this value is empty, <see cref="Crop" /> values are based on the actual input image dimensions.</summary>
+		/// <value>Default value: <see cref="Size.Empty" /></value>
+		public Size CropBasis { get; set; }
+		/// <summary>Determines which part of the image is preserved when automatic cropping is performed.</summary>
+		/// <include file='Docs/Remarks.xml' path='doc/member[@name="Anchor"]/*'/>
+		/// <value>Default value: <see cref="CropAnchor.Center" /></value>
+		public CropAnchor Anchor { get; set; }
+		/// <summary>Determines the container format of the output image. A value of <see cref="FileFormat.Auto" /> will choose the output codec based on the input image type.</summary>
+		/// <value>Default value: <see cref="FileFormat.Auto" /></value>
+		public FileFormat SaveFormat { get; set; }
+		/// <summary>The background color to use when converting to a non-transparent format and the fill color for <see cref="CropScaleMode.Pad" /> mode.</summary>
+		/// <include file='Docs/Remarks.xml' path='doc/member[@name="MatteColor"]/*'/>
+		/// <value>Default value: <see cref="Color.Empty" /></value>
+		public Color MatteColor { get; set; }
+		/// <summary>Determines whether Hybrid Scaling is allowed to be used to improve performance.</summary>
+		/// <include file='Docs/Remarks.xml' path='doc/member[@name="HybridMode"]/*'/>
+		/// <value>Default value: <see cref="HybridScaleMode.FavorQuality" /></value>
+		public HybridScaleMode HybridMode { get; set; }
+		/// <summary>Determines whether pixel blending is done using linear RGB or gamma-companded R'G'B'.</summary>
+		/// <remarks>Linear processing will yield better quality in almost all cases but with a performance cost.</remarks>
+		/// <value>Default value: <see cref="GammaMode.Linear" /></value>
+		public GammaMode BlendingMode { get; set; }
+		/// <summary>Determines whether automatic orientation correction is performed.</summary>
+		/// <value>Default value: <see cref="OrientationMode.Normalize" /></value>
+		public OrientationMode OrientationMode { get; set; }
+		/// <summary>Determines whether automatic colorspace conversion is performed.</summary>
+		/// <value>Default value: <see cref="ColorProfileMode.Normalize" /></value>
+		public ColorProfileMode ColorProfileMode { get; set; }
+		/// <summary>A list of metadata policy names or explicit metadata paths to be copied from the input image to the output image.</summary>
+		/// <include file='Docs/Remarks.xml' path='doc/member[@name="MetadataNames"]/*'/>
+		/// <value>Default value: <see cref="Enumerable.Empty" /></value>
+		public IEnumerable<string> MetadataNames { get; set; } = Enumerable.Empty<string>();
+
+		/// <summary>The width of the output image in pixels.  If auto-cropping is enabled, a value of <c>0</c> will set the width automatically based on the output height.</summary>
+		/// <remarks>If <see cref="Width"/> and <see cref="Height"/> are both set to <c>0</c>, no resizing will be performed but a crop may still be applied.</remarks>
+		/// <value>Default value: <c>0</c></value>
 		public int Width
 		{
-			get => OuterRect.Width;
+			get => OuterSize.Width;
 			set
 			{
 				if (value < 0) throw new ArgumentOutOfRangeException(nameof(Width), "Value must be >= 0");
-				OuterRect.Width = value;
+				OuterSize.Width = value;
 			}
 		}
 
-		/// <summary>The height of the output image in pixels.</summary>
+		/// <summary>The height of the output image in pixels.  If auto-cropping is enabled, a value of <c>0</c> will set the height automatically based on the output width.</summary>
+		/// <remarks>If <see cref="Width"/> and <see cref="Height"/> are both set to <c>0</c>, no resizing will be performed but a crop may still be applied.</remarks>
+		/// <value>Default value: <c>0</c></value>
 		public int Height
 		{
-			get => OuterRect.Height;
+			get => OuterSize.Height;
 			set
 			{
 				if (value < 0) throw new ArgumentOutOfRangeException(nameof(Height), "Value must be >= 0");
-				OuterRect.Height = value;
+				OuterSize.Height = value;
 			}
 		}
 
-		/// <summary>True if the output format requires indexed color, otherwise false.</summary>
-		public bool IndexedColor => SaveFormat == FileFormat.Png8 || SaveFormat == FileFormat.Gif;
-
-		/// <summary>The calculated ratio of the input image size to output size.</summary>
-		public double ScaleRatio => Math.Max(InnerRect.Width > 0 ? (double)Crop.Width / InnerRect.Width : 0d, InnerRect.Height > 0 ? (double)Crop.Height / InnerRect.Height : 0d);
-
-		/// <summary>The calculated ratio for the low-quality portion of a hybrid scaling operation.</summary>
-		public double HybridScaleRatio
+		/// <summary>The calculated ratio for the lower-quality portion of a hybrid scaling operation.</summary>
+		/// <value>Calculated based on <see cref="HybridScaleMode" /> and the ratio of input image size to output image size</value>
+		public int HybridScaleRatio
 		{
 			get
 			{
-				if (HybridMode == HybridScaleMode.Off || ScaleRatio < 2d)
-					return 1d;
+				if (HybridMode == HybridScaleMode.Off)
+					return 1;
 
 				double sr = ScaleRatio / (HybridMode == HybridScaleMode.FavorQuality ? 3d : HybridMode == HybridScaleMode.FavorSpeed ? 2d : 1d);
 
-				return Math.Pow(2d, Math.Floor(Math.Log(sr, 2d)));
+				return (int)Math.Pow(2d, Math.Floor(Math.Log(sr, 2d))).Clamp(1d, 32d);
 			}
 		}
 
 		/// <summary>The quality setting to use for JPEG output.</summary>
+		/// <remarks>If this value is set to <c>0</c>, the quality level will be set automatically according to the output image dimensions. Typically, this value should be <c>80</c> or greater if set explicitly.</remarks>
+		/// <value>Default value: calculated based on output image size</value>
 		public int JpegQuality
 		{
 			get
@@ -325,6 +254,8 @@ namespace PhotoSauce.MagicScaler
 		}
 
 		/// <summary>Determines what type of chroma subsampling is used for the output image.</summary>
+		/// <remarks>If this value is set to <see cref="ChromaSubsampleMode.Default"/>, the chroma subsampling will be set automatically based on the <see cref="JpegQuality"/> setting.</remarks>
+		/// <value>Default value: calculated based on <see cref="JpegQuality"/></value>
 		public ChromaSubsampleMode JpegSubsampleMode
 		{
 			get
@@ -332,12 +263,14 @@ namespace PhotoSauce.MagicScaler
 				if (jpegSubsampling != ChromaSubsampleMode.Default)
 					return jpegSubsampling;
 
-				return JpegQuality >= 95 ? ChromaSubsampleMode.Subsample444 : JpegQuality >= 91 ? ChromaSubsampleMode.Subsample422 : ChromaSubsampleMode.Subsample420;
+				return JpegQuality >= 95 ? ChromaSubsampleMode.Subsample444 : JpegQuality >= 90 ? ChromaSubsampleMode.Subsample422 : ChromaSubsampleMode.Subsample420;
 			}
 			set => jpegSubsampling = value;
 		}
 
 		/// <summary>Determines how resampling interpolation is performed.</summary>
+		/// <remarks>If this value is unset, the algorithm will be chosen automatically to maximize image quality and performance based on the ratio of input image size to output image size.</remarks>
+		/// <value>Default value: calculated based on resize ratio</value>
 		public InterpolationSettings Interpolation
 		{
 			get
@@ -360,7 +293,9 @@ namespace PhotoSauce.MagicScaler
 			set => interpolation = value;
 		}
 
-		/// <summary>Settings for automatic sharpening.</summary>
+		/// <summary>Settings for automatic post-resize sharpening.</summary>
+		/// <remarks>If this value is unset, the settings will be chosen automatically to maximize image quality based on the ratio of input image size to output image size.</remarks>
+		/// <value>Default value: calculated based on resize ratio</value>
 		public UnsharpMaskSettings UnsharpMask
 		{
 			get
@@ -394,7 +329,7 @@ namespace PhotoSauce.MagicScaler
 		/// <summary>Create a new <see cref="ProcessImageSettings" /> instance based on name/value pairs in a dictionary.</summary>
 		/// <param name="dic">The dictionary containing the name/value pairs.</param>
 		/// <returns>A new settings instance.</returns>
-		public static ProcessImageSettings FromDictionary(IDictionary<string, string> dic)
+		public static ProcessImageSettings FromDictionary(IDictionary<string, string?> dic)
 		{
 			if (dic == null) throw new ArgumentNullException(nameof(dic));
 			if (dic.Count == 0) return new ProcessImageSettings();
@@ -414,8 +349,14 @@ namespace PhotoSauce.MagicScaler
 
 			if (cropExpression.Value.IsMatch(dic.GetValueOrDefault("crop") ?? string.Empty))
 			{
-				string[] ps = dic["crop"].Split(',');
+				var ps = dic["crop"]!.Split(',');
 				s.Crop = new Rectangle(int.Parse(ps[0]), int.Parse(ps[1]), int.Parse(ps[2]), int.Parse(ps[3]));
+			}
+
+			if (cropBasisExpression.Value.IsMatch(dic.GetValueOrDefault("cropbasis") ?? string.Empty))
+			{
+				var ps = dic["cropbasis"]!.Split(',');
+				s.CropBasis = new Size(int.Parse(ps[0]), int.Parse(ps[1]));
 			}
 
 			foreach (var group in anchorExpression.Value.Match(dic.GetValueOrDefault("anchor") ?? string.Empty).Groups.Cast<Group>())
@@ -427,16 +368,11 @@ namespace PhotoSauce.MagicScaler
 			foreach (var cap in subsampleExpression.Value.Match(dic.GetValueOrDefault("subsample") ?? string.Empty).Captures.Cast<Capture>())
 				s.JpegSubsampleMode = Enum.TryParse(string.Concat("Subsample", cap.Value), true, out ChromaSubsampleMode csub) ? csub : s.JpegSubsampleMode;
 
-			string color = dic.GetValueOrDefault("bgcolor") ?? dic.GetValueOrDefault("bg");
-			if (!string.IsNullOrWhiteSpace(color))
-			{
-				if (hexColorExpression.Value.IsMatch(color))
-					color = string.Concat('#', color);
+			string? colorName = dic.GetValueOrDefault("bgcolor") ?? dic.GetValueOrDefault("bg");
+			if (!string.IsNullOrWhiteSpace(colorName) && ColorParser.TryParse(colorName, out var color))
+				s.MatteColor = color;
 
-				try { s.MatteColor = (Color)(new ColorConverter()).ConvertFromString(color); } catch { }
-			}
-
-			string filter = dic.GetValueOrDefault("filter")?.ToLower();
+			string? filter = dic.GetValueOrDefault("filter")?.ToLower();
 			switch (filter)
 			{
 				case "point":
@@ -476,13 +412,13 @@ namespace PhotoSauce.MagicScaler
 
 		/// <summary>Create a new <see cref="ProcessImageSettings" /> instance with settings calculated for a specific input image.</summary>
 		/// <param name="settings">The input settings.</param>
-		/// <param name="imageInfo">The input image on which the new settings should be calculated.</param>
+		/// <param name="imageInfo">The input image for which the new settings should be calculated.</param>
 		/// <returns>The calculated settings for the input image.</returns>
 		public static ProcessImageSettings Calculate(ProcessImageSettings settings, ImageFileInfo imageInfo)
 		{
 			var clone = settings.Clone();
 			clone.NormalizeFrom(imageInfo);
-			clone.imageInfo = null;
+			clone.imageInfo = default;
 
 			return clone;
 		}
@@ -492,20 +428,57 @@ namespace PhotoSauce.MagicScaler
 			int imgWidth = swapDimensions ? inHeight : inWidth;
 			int imgHeight = swapDimensions ? inWidth : inHeight;
 
-			var whole = new Rectangle(0, 0, imgWidth, imgHeight);
-			bool needsCrop = Crop.IsEmpty || Crop != Rectangle.Intersect(whole, Crop);
+			if (!Crop.IsEmpty && !CropBasis.IsEmpty)
+			{
+				var crop = Crop;
+				if (CropBasis.Width > 0)
+				{
+					double xrat = (double)imgWidth / CropBasis.Width;
+					crop.X = (int)Math.Floor(Crop.Left * xrat);
+					crop.Width = Math.Min((int)Math.Ceiling(Crop.Width * xrat), imgWidth - crop.X);
+				}
+				if (CropBasis.Height > 0)
+				{
+					double yrat = (double)imgHeight / CropBasis.Height;
+					crop.Y = (int)Math.Floor(Crop.Top * yrat);
+					crop.Height = Math.Min((int)Math.Ceiling(Crop.Height * yrat), imgHeight - crop.Y);
+				}
 
-			if (Width == 0 || Height == 0)
+				Crop = crop;
+				CropBasis = new Size(imgWidth, imgHeight);
+			}
+
+			if (!Crop.IsEmpty && (Crop.Width <= 0 || Crop.Height <= 0))
+			{
+				var crop = Crop;
+				if (crop.Width <= 0)
+				{
+					int rem = Math.Max(1, imgWidth - crop.X);
+					crop.Width = crop.Width == 0 ? rem : (imgWidth - crop.X + crop.Width).Clamp(1, rem);
+				}
+				if (crop.Height <= 0)
+				{
+					int rem = Math.Max(1, imgHeight - crop.Y);
+					crop.Height = crop.Height == 0 ? rem : (imgHeight - crop.Y + crop.Height).Clamp(1, rem);
+				}
+
+				Crop = crop;
+			}
+
+			var whole = new Rectangle(0, 0, imgWidth, imgHeight);
+			AutoCrop = Crop.IsEmpty || Crop != Rectangle.Intersect(whole, Crop);
+
+			if ((Width == 0 || Height == 0) && (ResizeMode == CropScaleMode.Pad || ResizeMode == CropScaleMode.Stretch))
 				ResizeMode = CropScaleMode.Crop;
 
-			if (Width == 0 && Height == 0)
+			if (OuterSize.IsEmpty)
 			{
-				Crop = needsCrop ? whole : Crop;
-				OuterRect = InnerRect = new Rectangle(0, 0, Crop.Width, Crop.Height);
+				Crop = AutoCrop ? whole : Crop;
+				OuterSize = InnerSize = new Size(Crop.Width, Crop.Height);
 				return;
 			}
 
-			if (!needsCrop || ResizeMode != CropScaleMode.Crop)
+			if (!AutoCrop || ResizeMode != CropScaleMode.Crop)
 				Anchor = CropAnchor.Center;
 
 			int wwin = imgWidth, hwin = imgHeight;
@@ -513,7 +486,7 @@ namespace PhotoSauce.MagicScaler
 			double wrat = width > 0 ? (double)wwin / width : (double)hwin / height;
 			double hrat = height > 0 ? (double)hwin / height : wrat;
 
-			if (needsCrop)
+			if (AutoCrop)
 			{
 				if (ResizeMode == CropScaleMode.Crop)
 				{
@@ -535,36 +508,38 @@ namespace PhotoSauce.MagicScaler
 				}
 			}
 
+			if (width == 0 && (ResizeMode == CropScaleMode.Contain || ResizeMode == CropScaleMode.Max))
+				width = int.MaxValue;
+			if (height == 0 && (ResizeMode == CropScaleMode.Contain || ResizeMode == CropScaleMode.Max))
+				height = int.MaxValue;
+
 			wrat = width > 0 ? (double)Crop.Width / width : (double)Crop.Height / height;
 			hrat = height > 0 ? (double)Crop.Height / height : wrat;
 
-			if (ResizeMode == CropScaleMode.Max || ResizeMode == CropScaleMode.Pad)
+			if (ResizeMode == CropScaleMode.Contain || ResizeMode == CropScaleMode.Max || ResizeMode == CropScaleMode.Pad)
 			{
-				double rat = Math.Max(wrat, hrat);
 				int dim = Math.Max(width, height);
+
+				double rat = Math.Max(wrat, hrat);
+				if (ResizeMode == CropScaleMode.Max)
+					rat = Math.Max(rat, 1d);
 
 				width = MathUtil.Clamp((int)Math.Round(Crop.Width / rat), 1, dim);
 				height = MathUtil.Clamp((int)Math.Round(Crop.Height / rat), 1, dim);
 			}
 
-			InnerRect.Width = width > 0 ? width : Math.Max((int)Math.Round(Crop.Width / wrat), 1);
-			InnerRect.Height = height > 0 ? height : Math.Max((int)Math.Round(Crop.Height / hrat), 1);
+			InnerSize.Width = width > 0 ? width : Math.Max((int)Math.Round(Crop.Width / wrat), 1);
+			InnerSize.Height = height > 0 ? height : Math.Max((int)Math.Round(Crop.Height / hrat), 1);
 
-			if (ResizeMode == CropScaleMode.Crop || ResizeMode == CropScaleMode.Max)
-				OuterRect = InnerRect;
-
-			if (ResizeMode == CropScaleMode.Pad)
-			{
-				InnerRect.X = (OuterRect.Width - InnerRect.Width) / 2;
-				InnerRect.Y = (OuterRect.Height - InnerRect.Height) / 2;
-			}
+			if (ResizeMode == CropScaleMode.Crop || ResizeMode == CropScaleMode.Contain || ResizeMode == CropScaleMode.Max)
+				OuterSize = InnerSize;
 		}
 
 		internal void SetSaveFormat(FileFormat containerType, bool frameHasAlpha)
 		{
 			if (containerType == FileFormat.Gif) // Restrict to animated only?
 				SaveFormat = FileFormat.Gif;
-			else if (containerType == FileFormat.Png || ((frameHasAlpha || InnerRect != OuterRect) && MatteColor.A < byte.MaxValue))
+			else if (containerType == FileFormat.Png || ((frameHasAlpha || InnerSize != OuterSize) && MatteColor.A < byte.MaxValue))
 				SaveFormat = FileFormat.Png;
 			else
 				SaveFormat = FileFormat.Jpeg;
@@ -572,14 +547,14 @@ namespace PhotoSauce.MagicScaler
 
 		internal void NormalizeFrom(ImageFileInfo img)
 		{
-			if (FrameIndex >= img.Frames.Length || img.Frames.Length + FrameIndex < 0) throw new InvalidOperationException($"Invalid {nameof(FrameIndex)}");
+			if (FrameIndex >= img.Frames.Count || img.Frames.Count + FrameIndex < 0) throw new InvalidOperationException($"Invalid {nameof(FrameIndex)}");
 
 			if (FrameIndex < 0)
-				FrameIndex = img.Frames.Length + FrameIndex;
+				FrameIndex = img.Frames.Count + FrameIndex;
 
 			var frame = img.Frames[FrameIndex];
 
-			Fixup(frame.Width, frame.Height, OrientationMode != OrientationMode.Normalize && frame.ExifOrientation.RequiresDimensionSwap());
+			Fixup(frame.Width, frame.Height, OrientationMode != OrientationMode.Normalize && frame.ExifOrientation.SwapsDimensions());
 
 			if (SaveFormat == FileFormat.Auto)
 				SetSaveFormat(img.ContainerType, frame.HasAlpha);
@@ -590,52 +565,53 @@ namespace PhotoSauce.MagicScaler
 				JpegQuality = 0;
 			}
 
-			if (!frame.HasAlpha && InnerRect == OuterRect)
+			if (!frame.HasAlpha && InnerSize == OuterSize)
 				MatteColor = Color.Empty;
 
 			if (!Sharpen)
 				UnsharpMask = UnsharpMaskSettings.None;
+
+			if (ColorProfileMode <= ColorProfileMode.NormalizeAndEmbed && (SaveFormat == FileFormat.Bmp || SaveFormat == FileFormat.Gif))
+				ColorProfileMode = ColorProfileMode.ConvertToSrgb;
 
 			imageInfo = img;
 		}
 
 		internal string GetCacheHash()
 		{
-			Debug.Assert(Normalized, "Hash is only valid for normalized settings.");
+			if (imageInfo is null) throw new InvalidOperationException("Hash is only valid for normalized settings.");
+			if (!(Interpolation.WeightingFunction is IUniquelyIdentifiable uif)) throw new InvalidOperationException("Hash is only valid for internal interpolators.");
 
-			using (var bw = new BinaryWriter(new MemoryStream(256), Encoding.UTF8))
+			var hash = Blake2b.CreateIncrementalHasher(CacheHash.DigestLength);
+			hash.Update(imageInfo.FileSize);
+			hash.Update(imageInfo.FileDate.Ticks);
+			hash.Update(FrameIndex);
+			hash.Update(Crop);
+			hash.Update(InnerSize);
+			hash.Update(OuterSize);
+			hash.Update(MatteColor.ToArgb());
+			hash.Update(BlendingMode);
+			hash.Update(OrientationMode);
+			hash.Update(ColorProfileMode);
+			hash.Update(HybridScaleRatio);
+			hash.Update(uif.UniqueID);
+			hash.Update(Interpolation.Blur);
+			hash.Update(UnsharpMask);
+			hash.Update(SaveFormat);
+
+			if (SaveFormat == FileFormat.Jpeg)
 			{
-				bw.Write(imageInfo?.FileSize ?? 0L);
-				bw.Write(imageInfo?.FileDate.Ticks ?? 0L);
-				bw.Write(FrameIndex);
-				bw.Write(Width);
-				bw.Write(Height);
-				bw.Write((int)SaveFormat);
-				bw.Write((int)BlendingMode | ((int)OrientationMode << 8) | ((int)ColorProfileMode << 16));
-				bw.Write((int)ResizeMode);
-				bw.Write((int)Anchor);
-				bw.Write(Crop.X);
-				bw.Write(Crop.Y);
-				bw.Write(Crop.Width);
-				bw.Write(Crop.Height);
-				bw.Write(MatteColor.A);
-				bw.Write(MatteColor.R);
-				bw.Write(MatteColor.G);
-				bw.Write(MatteColor.B);
-				bw.Write(HybridScaleRatio);
-				bw.Write(Interpolation.WeightingFunction.ToString());
-				bw.Write(Interpolation.Blur);
-				bw.Write(UnsharpMask.Amount);
-				bw.Write(UnsharpMask.Radius);
-				bw.Write(UnsharpMask.Threshold);
-				bw.Write(JpegQuality);
-				bw.Write((int)JpegSubsampleMode);
-				foreach (string m in MetadataNames ?? Enumerable.Empty<string>())
-					bw.Write(m);
-
-				((MemoryStream)bw.BaseStream).TryGetBuffer(out var buff);
-				return CacheHash.Create(buff);
+				hash.Update(JpegSubsampleMode);
+				hash.Update(JpegQuality);
 			}
+
+			foreach (string m in MetadataNames ?? Enumerable.Empty<string>())
+				hash.Update(m.AsSpan());
+
+			var hbuff = (Span<byte>)stackalloc byte[hash.DigestLength];
+			hash.Finish(hbuff);
+
+			return CacheHash.Encode(hbuff);
 		}
 
 		internal ProcessImageSettings Clone() => (ProcessImageSettings)MemberwiseClone();

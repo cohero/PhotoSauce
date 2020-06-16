@@ -1,0 +1,30 @@
+trigger:
+- master
+
+pool:
+  vmImage: windows-latest
+
+name: $(Year:yy)$(DayOfYear)$(Rev:r)
+steps:
+- checkout: self
+  submodules: true
+
+- task: UseDotNet@2
+  displayName: Ensure 5.0 SDK
+  inputs:
+    version: 5.0.x
+    includePreviewVersions: true
+
+- script: |
+    dotnet build src\MagicScaler -c Dist --version-suffix ci$(Build.BuildNumber)
+    dotnet build src\WebRSize -c Dist --version-suffix ci$(Build.BuildNumber)
+  displayName: Build
+
+- task: NuGetAuthenticate@0
+  condition: ne(variables['Build.Reason'], 'PullRequest')
+
+- script: |
+    dotnet nuget push --api-key AzureArtifacts --source https://pkgs.dev.azure.com/saucecontrol/PhotoSauce/_packaging/photosauce_ci/nuget/v3/index.json out\bin\MagicScaler\Dist\PhotoSauce.MagicScaler.*.nupkg
+    dotnet nuget push --api-key AzureArtifacts --source https://pkgs.dev.azure.com/saucecontrol/PhotoSauce/_packaging/photosauce_ci/nuget/v3/index.json out\bin\WebRSize\Dist\PhotoSauce.WebRSize.*.nupkg
+  displayName: Push
+  condition: ne(variables['Build.Reason'], 'PullRequest')

@@ -1,172 +1,225 @@
 ﻿using System;
 using System.Drawing;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
-
-using PhotoSauce.MagicScaler.Interop;
+using System.Runtime.CompilerServices;
 
 namespace PhotoSauce.MagicScaler
 {
-	/// <summary>Provides a mechanism for accessing raw pixel data from an image.</summary>
-	public interface IPixelSource
-	{
-		/// <summary>The binary representation of the pixel data.  Must be one of the values from <see cref="PixelFormats" />.</summary>
-		Guid Format { get; }
-		/// <summary>The width of the image in pixels</summary>
-		int Width { get; }
-		/// <summary>The height of the image in pixels</summary>
-		int Height { get; }
-
-		/// <summary>Copies the image pixels bounded by <paramref name="sourceArea" /> to the provided <paramref name="buffer" />.</summary>
-		/// <param name="sourceArea">A <see cref="Rectangle" /> that bounds the area of interest.</param>
-		/// <param name="cbStride">The number of bytes between pixels in the same image column within the buffer.</param>
-		/// <param name="buffer">A target memory buffer that will receive the pixel data.</param>
-		void CopyPixels(Rectangle sourceArea, int cbStride, Span<byte> buffer);
-	}
-
 	internal abstract class PixelSource
 	{
-		private readonly Lazy<PixelSourceStats> stats;
+		protected IPixelSourceProfiler Profiler { get; }
 
-		public PixelFormat Format { get; protected set; }
-		public uint Width { get; protected set; }
-		public uint Height { get; protected set; }
-		public IWICBitmapSource WicSource { get; protected set; }
+		public abstract PixelFormat Format { get; }
+		public abstract int Width { get; }
+		public abstract int Height { get; }
 
-		protected Stopwatch Timer { get; } = new Stopwatch();
-		protected PixelSource Source { get; set; }
-		protected uint BufferStride { get; set; }
+		public PixelArea Area => new PixelArea(0, 0, Width, Height);
 
-		public PixelSourceStats Stats => stats.Value;
+		public PixelSourceStats? Stats => Profiler is SourceStatsProfiler ps ? ps.Stats : null;
 
 		protected PixelSource() =>
-			stats = new Lazy<PixelSourceStats>(() => new PixelSourceStats { SourceName = ToString().Replace($"{nameof(PhotoSauce)}.{nameof(MagicScaler)}.", string.Empty) });
+			Profiler = MagicImageProcessor.EnablePixelSourceStats ? new SourceStatsProfiler(this) : NoopProfiler.Instance;
 
-		protected PixelSource(PixelSource source) : this()
+		[Conditional("GUARDRAILS")]
+		private void checkBounds(in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer)
 		{
-			Source = source;
-			WicSource = this.AsIWICBitmapSource();
-			Format = Source.Format;
-			Width = Source.Width;
-			Height = Source.Height;
-			BufferStride = (Width * (uint)Format.BitsPerPixel + 7u) / 8u + ((uint)IntPtr.Size - 1u) & ~((uint)IntPtr.Size - 1u);
-		}
+			int cbLine = MathUtil.DivCeiling(prc.Width * Format.BitsPerPixel, 8);
 
-		protected abstract void CopyPixelsInternal(in Rectangle prc, uint cbStride, uint cbBufferSize, IntPtr pbBuffer);
-
-		public void CopyPixels(in Rectangle prc, uint cbStride, uint cbBufferSize, IntPtr pbBuffer)
-		{
-			uint cbLine = (uint)(prc.Width * Format.BitsPerPixel + 7) / 8u;
-
-			if (prc.X < 0 || prc.Y < 0 || prc.Width < 0 || prc.Height < 0 || prc.X + prc.Width > (int)Width || prc.Y + prc.Height > (int)Height)
+			if (prc.X + prc.Width > Width || prc.Y + prc.Height > Height)
 				throw new ArgumentOutOfRangeException(nameof(prc), "Requested area does not fall within the image bounds");
 
 			if (cbLine > cbStride)
 				throw new ArgumentOutOfRangeException(nameof(cbStride), "Stride is too small for the requested area");
 
-			if (((uint)prc.Height - 1u) * cbStride + cbLine > cbBufferSize)
+			if ((prc.Height - 1) * cbStride + cbLine > cbBufferSize)
 				throw new ArgumentOutOfRangeException(nameof(cbBufferSize), "Buffer is too small for the requested area");
 
 			if (pbBuffer == IntPtr.Zero)
 				throw new ArgumentOutOfRangeException(nameof(pbBuffer), "Buffer pointer is invalid");
+		}
 
-			Timer.Restart();
+		protected abstract void CopyPixelsInternal(in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer);
+
+		public void CopyPixels(in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer)
+		{
+			checkBounds(prc, cbStride, cbBufferSize, pbBuffer);
+
+			Profiler.ResumeTiming();
 			CopyPixelsInternal(prc, cbStride, cbBufferSize, pbBuffer);
-			Timer.Stop();
+			Profiler.PauseTiming();
 
-			var stats = Stats;
-			stats.CallCount++;
-			stats.PixelCount += prc.Width * prc.Height;
-			stats.ProcessingTime += Timer.ElapsedMilliseconds();
+			Profiler.LogCopyPixels(prc);
+		}
+	}
+
+	internal class PixelSourceFrame : IImageFrame
+	{
+		public double DpiX => 96d;
+		public double DpiY => 96d;
+		public Orientation ExifOrientation { get; set; } = Orientation.Normal;
+		public ReadOnlySpan<byte> IccProfile => ReadOnlySpan<byte>.Empty;
+
+		public IPixelSource PixelSource { get; }
+
+		public PixelSourceFrame(IPixelSource source) => PixelSource = source;
+
+		public void Dispose() { }
+	}
+
+	internal class PixelSourceContainer : IImageContainer
+	{
+		private readonly IPixelSource pixelSource;
+
+		public FileFormat ContainerFormat => FileFormat.Unknown;
+		public int FrameCount => 1;
+
+		public PixelSourceContainer(IPixelSource source) => pixelSource = source;
+
+		public IImageFrame GetFrame(int index) => index == 0 ? new PixelSourceFrame(pixelSource) : throw new IndexOutOfRangeException();
+	}
+
+	internal abstract class ChainedPixelSource : PixelSource
+	{
+		protected PixelSource PrevSource { get; private set; }
+
+		protected int BufferStride => MathUtil.PowerOfTwoCeiling(PrevSource.Width * PrevSource.Format.BytesPerPixel, IntPtr.Size);
+
+		protected ChainedPixelSource(PixelSource source) : base() => PrevSource = source;
+
+		public override PixelFormat Format => PrevSource.Format;
+		public override int Width => PrevSource.Width;
+		public override int Height => PrevSource.Height;
+
+		public virtual bool Passthrough => true;
+		protected virtual void Reset() { }
+
+		public void ReInit(PixelSource newSource)
+		{
+			Reset();
+
+			if (newSource == this)
+				return;
+
+			var prev = PrevSource;
+			if (prev is ChainedPixelSource chain && chain.Passthrough)
+			{
+				chain.ReInit(newSource);
+				return;
+			}
+
+			if (prev.Format != newSource.Format || prev.Width != newSource.Width || prev.Height != newSource.Height)
+				throw new NotSupportedException("New source is not compatible with current pipeline.");
+
+			PrevSource = newSource;
+		}
+	}
+
+	internal sealed class NoopPixelSource : PixelSource
+	{
+		public static readonly PixelSource Instance = new NoopPixelSource();
+
+		public override PixelFormat Format => PixelFormat.Grey32BppFloat;
+		public override int Width => default;
+		public override int Height => default;
+
+		protected override void CopyPixelsInternal(in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer) { }
+	}
+
+	internal sealed class FrameBufferSource : PixelSource, IDisposable
+	{
+		private ArraySegment<byte> frameBuff;
+
+		public int Stride { get; }
+
+		public Span<byte> Span => frameBuff.AsSpan();
+
+		public override PixelFormat Format { get; }
+		public override int Width { get; }
+		public override int Height { get; }
+
+		public FrameBufferSource(int width, int height, PixelFormat format) : base()
+		{
+			Format = format;
+			Width = width;
+			Height = height;
+
+			Stride = MathUtil.PowerOfTwoCeiling(width * Format.BytesPerPixel, HWIntrinsics.VectorCount<byte>());
+
+			frameBuff = BufferPool.Rent(Stride * height, true);
+		}
+
+		public void PauseTiming() => Profiler.PauseTiming();
+		public void ResumeTiming() => Profiler.ResumeTiming();
+
+		public void Dispose()
+		{
+			BufferPool.Return(frameBuff);
+			frameBuff = default;
+		}
+
+		public override string ToString() => nameof(FrameBufferSource);
+
+		unsafe protected override void CopyPixelsInternal(in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer)
+		{
+			if (frameBuff.Array is null) throw new ObjectDisposedException(nameof(FrameBufferSource));
+
+			int bpp = Format.BytesPerPixel;
+			int cb = prc.Width * bpp;
+
+			ref byte buff = ref frameBuff.Array[frameBuff.Offset + prc.Y * Stride + prc.X * bpp];
+
+			for (int y = 0; y < prc.Height; y++)
+				Unsafe.CopyBlockUnaligned(ref Unsafe.AsRef<byte>((byte*)pbBuffer + y * cbStride), ref Unsafe.Add(ref buff, y * Stride), (uint)cb);
 		}
 	}
 
 	internal static class PixelSourceExtensions
 	{
-		private class PixelSourceFromIWICBitmapSource : PixelSource
+		private sealed class PixelSourceFromIPixelSource : PixelSource
 		{
-			private readonly IWICBitmapSource realSource;
-			private readonly WICRect sourceRect;
-			private readonly string sourceName;
+			private readonly IPixelSource upstreamSource;
 
-			public PixelSourceFromIWICBitmapSource(IWICBitmapSource source, string name, bool profile = true) : base()
-			{
-				realSource = source;
-				sourceRect = new WICRect();
-				sourceName = profile ? name : $"{name} (nonprofiling)";
-				WicSource = profile ? this.AsIWICBitmapSource() : source;
-				Format = PixelFormat.Cache[source.GetPixelFormat()];
-				source.GetSize(out uint width, out uint height);
-				Width = width;
-				Height = height;
-			}
+			public override PixelFormat Format { get; }
+			public override int Width => upstreamSource.Width;
+			public override int Height => upstreamSource.Height;
 
-			protected override void CopyPixelsInternal(in Rectangle prc, uint cbStride, uint cbBufferSize, IntPtr pbBuffer) =>
-				realSource.CopyPixels(sourceRect.FromGdiRect(prc), cbStride, cbBufferSize, pbBuffer);
+			public PixelSourceFromIPixelSource(IPixelSource source) => (upstreamSource, Format) = (source, PixelFormat.FromGuid(source.Format));
 
-			public override string ToString() => sourceName;
+			unsafe protected override void CopyPixelsInternal(in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer) =>
+				upstreamSource.CopyPixels(prc.ToGdiRect(), cbStride, new Span<byte>(pbBuffer.ToPointer(), cbBufferSize));
+
+			public override string? ToString() => upstreamSource.ToString();
 		}
 
-		private class PixelSourceAsIWICBitmapSource : IWICBitmapSource
-		{
-			private readonly PixelSource source;
-
-			public PixelSourceAsIWICBitmapSource(PixelSource src) => source = src;
-
-			public void GetSize(out uint puiWidth, out uint puiHeight)
-			{
-				puiWidth = source.Width;
-				puiHeight = source.Height;
-			}
-
-			public Guid GetPixelFormat() => source.Format.FormatGuid;
-
-			public void GetResolution(out double pDpiX, out double pDpiY) => pDpiX = pDpiY = 96d;
-
-			public void CopyPalette(IWICPalette pIPalette) => throw new NotImplementedException();
-
-			public void CopyPixels(WICRect prc, uint cbStride, uint cbBufferSize, IntPtr pbBuffer) =>
-				source.CopyPixels(prc.ToGdiRect(), cbStride, cbBufferSize, pbBuffer);
-		}
-
-		private class PixelSourceFromIPixelSource : PixelSource
-		{
-			private readonly IPixelSource realSource;
-
-			public PixelSourceFromIPixelSource(IPixelSource source) : base()
-			{
-				realSource = source;
-				WicSource = this.AsIWICBitmapSource();
-				Format = PixelFormat.Cache[source.Format];
-				Width = (uint)source.Width;
-				Height = (uint)source.Height;
-			}
-
-			unsafe protected override void CopyPixelsInternal(in Rectangle prc, uint cbStride, uint cbBufferSize, IntPtr pbBuffer) =>
-				realSource.CopyPixels(prc, (int)cbStride, new Span<byte>(pbBuffer.ToPointer(), (int)cbBufferSize));
-
-			public override string ToString() => realSource.ToString();
-		}
-
-		private class PixelSourceAsIPixelSource : IPixelSource
+		private sealed class PixelSourceAsIPixelSource : IPixelSource
 		{
 			private readonly PixelSource source;
 
 			public PixelSourceAsIPixelSource(PixelSource src) => source = src;
 
 			public Guid Format => source.Format.FormatGuid;
-			public int Width => (int)source.Width;
-			public int Height => (int)source.Height;
+			public int Width => source.Width;
+			public int Height => source.Height;
 
-			unsafe public void CopyPixels(Rectangle prc, int cbStride, Span<byte> buffer)
+			unsafe public void CopyPixels(Rectangle sourceArea, int cbStride, Span<byte> buffer)
 			{
-				fixed (byte* pbBuffer = &MemoryMarshal.GetReference(buffer))
-					source.CopyPixels(prc, (uint)cbStride, (uint)buffer.Length, (IntPtr)pbBuffer);
+				var prc = PixelArea.FromGdiRect(sourceArea);
+				int cbLine = MathUtil.DivCeiling(prc.Width * source.Format.BitsPerPixel, 8);
+				int cbBuffer = buffer.Length;
+
+				if (prc.X + prc.Width > Width || prc.Y + prc.Height > Height)
+					throw new ArgumentOutOfRangeException(nameof(prc), "Requested area does not fall within the image bounds");
+
+				if (cbLine > cbStride)
+					throw new ArgumentOutOfRangeException(nameof(cbStride), "Stride is too small for the requested area");
+
+				if ((prc.Height - 1) * cbStride + cbLine > cbBuffer)
+					throw new ArgumentOutOfRangeException(nameof(buffer), "Buffer is too small for the requested area");
+
+				fixed (byte* pbBuffer = buffer)
+					source.CopyPixels(prc, cbStride, cbBuffer, (IntPtr)pbBuffer);
 			}
 		}
-
-		public static PixelSource AsPixelSource(this IWICBitmapSource source, string name, bool profile = true) => new PixelSourceFromIWICBitmapSource(source, name, profile);
-		public static IWICBitmapSource AsIWICBitmapSource(this PixelSource source) => new PixelSourceAsIWICBitmapSource(source);
 
 		public static PixelSource AsPixelSource(this IPixelSource source) => new PixelSourceFromIPixelSource(source);
 		public static IPixelSource AsIPixelSource(this PixelSource source) => new PixelSourceAsIPixelSource(source);

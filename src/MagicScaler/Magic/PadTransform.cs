@@ -1,86 +1,81 @@
 ﻿using System;
 using System.Drawing;
 
-#if DRAWING_SHIM_COLOR
-using System.Drawing.ColorShim;
-#endif
-
-namespace PhotoSauce.MagicScaler
+namespace PhotoSauce.MagicScaler.Transforms
 {
-	internal class PadTransformInternal : PixelSource
+	internal sealed class PadTransformInternal : ChainedPixelSource
 	{
-		private readonly int bytesPerPixel;
-		private readonly uint bgra;
-		private readonly byte fillB;
-		private readonly byte fillG;
-		private readonly byte fillR;
-		private readonly Rectangle irect;
+		private readonly bool passthrough;
+		private readonly uint fill;
+		private readonly PixelArea inner;
 
-		public PadTransformInternal(PixelSource source, Color color, Rectangle innerRect, Rectangle outerRect) : base(source)
+		public override int Width { get; }
+		public override int Height { get; }
+
+		public override bool Passthrough => passthrough;
+
+		public PadTransformInternal(PixelSource source, Color color, PixelArea innerArea, PixelArea outerArea, bool replay = false) : base(source)
 		{
-			bytesPerPixel = Format.BitsPerPixel / 8;
-
-			if (Format.NumericRepresentation != PixelNumericRepresentation.UnsignedInteger || Format.ChannelCount != bytesPerPixel)
+			if (Format.NumericRepresentation != PixelNumericRepresentation.UnsignedInteger || Format.ChannelCount != Format.BytesPerPixel)
 				throw new NotSupportedException("Pixel format not supported.");
 
-			bgra = (uint)color.ToArgb();
-			fillB = color.B;
-			fillG = color.G;
-			fillR = color.R;
+			fill = (uint)color.ToArgb();
 
-			irect = innerRect;
-			Width = (uint)outerRect.Width;
-			Height = (uint)outerRect.Height;
+			passthrough = !replay;
+			inner = innerArea;
+			Width = outerArea.Width;
+			Height = outerArea.Height;
 		}
 
-		unsafe protected override void CopyPixelsInternal(in Rectangle prc, uint cbStride, uint cbBufferSize, IntPtr pbBuffer)
+		unsafe protected override void CopyPixelsInternal(in PixelArea prc, int cbStride, int cbBufferSize, IntPtr pbBuffer)
 		{
-			var trect = new Rectangle { X = Math.Max(prc.X - irect.X, 0), Height = 1 };
-			trect.Width = Math.Min(prc.Width, Math.Min(Math.Max(prc.X + prc.Width - irect.X, 0), irect.Width - trect.X));
-			int cx = Math.Max(irect.X - prc.X, 0);
+			int bpp = Format.BytesPerPixel;
+			int tx = Math.Max(prc.X - inner.X, 0);
+			int tw = Math.Min(prc.Width, Math.Min(Math.Max(prc.X + prc.Width - inner.X, 0), inner.Width - tx));
+			int cx = Math.Max(inner.X - prc.X, 0);
+			byte* pb = (byte*)pbBuffer;
 
 			for (int y = 0; y < prc.Height; y++)
 			{
 				int cy = prc.Y + y;
-				byte* pb = (byte*)(pbBuffer + y * (int)cbStride);
 
-				if (trect.Width < prc.Width || cy < irect.Y || cy >= irect.Bottom)
+				if (tw < prc.Width || cy < inner.Y || cy >= inner.Y + inner.Height)
 				{
-					if (bytesPerPixel == 1)
-						new Span<byte>(pb, prc.Width).Fill(fillB);
-					else if (bytesPerPixel == 4)
-						new Span<uint>(pb, prc.Width).Fill(bgra);
-					else
+					switch (bpp)
 					{
-						byte* pp = pb, pe = pb + prc.Width * 3;
-						while (pp < pe)
-						{
-							pp[0] = fillB;
-							pp[1] = fillG;
-							pp[2] = fillR;
-							pp += 3;
-						}
+						case 1:
+							new Span<byte>(pb, prc.Width).Fill((byte)fill);
+							break;
+						case 3:
+							new Span<triple>(pb, prc.Width).Fill((triple)fill);
+							break;
+						case 4:
+							new Span<uint>(pb, prc.Width).Fill(fill);
+							break;
 					}
 				}
 
-				if (trect.Width > 0 && cy >= irect.Y && cy < irect.Bottom)
+				if (tw > 0 && cy >= inner.Y && cy < inner.Y + inner.Height)
 				{
-					trect.Y = cy - irect.Y;
-					Timer.Stop();
-					Source.CopyPixels(trect, cbStride, cbBufferSize, (IntPtr)(pb + cx * bytesPerPixel));
-					Timer.Start();
+					Profiler.PauseTiming();
+					PrevSource.CopyPixels(new PixelArea(tx, cy - inner.Y, tw, 1), cbStride, cbBufferSize, (IntPtr)(pb + cx * bpp));
+					Profiler.ResumeTiming();
 				}
+
+				pb += cbStride;
 			}
 		}
+
+		public override string ToString() => nameof(PadTransform);
 	}
 
 	/// <summary>Adds solid-colored padding pixels to an image.</summary>
-	public sealed class PadTransform : PixelTransform, IPixelTransformInternal
+	public sealed class PadTransform : PixelTransformInternalBase, IPixelTransformInternal
 	{
 		private readonly Color padColor;
 		private readonly Rectangle padRect;
 
-		/// <summary>Constructs a new <see cref="PadTransform" /> using the specified <see cref="Color"/> and sizes.</summary>
+		/// <summary>Constructs a new <see cref="PadTransform" /> using the specified <see cref="Color" /> and sizes.</summary>
 		/// <param name="color">The <see cref="Color" /> of the padding pixels.</param>
 		/// <param name="top">The number of pixels to add to the image top.</param>
 		/// <param name="right">The number of pixels to add to the image right.</param>
@@ -88,8 +83,8 @@ namespace PhotoSauce.MagicScaler
 		/// <param name="left">The number of pixels to add to the image left.</param>
 		public PadTransform(Color color, int top, int right, int bottom, int left)
 		{
-			void throwOutOfRange(string name) =>
-				throw new ArgumentOutOfRangeException(nameof(left), $"Value must be between 0 and {short.MaxValue}");
+			static void throwOutOfRange(string name) =>
+				throw new ArgumentOutOfRangeException(name, $"Value must be between 0 and {short.MaxValue}");
 
 			if ((uint)top > short.MaxValue) throwOutOfRange(nameof(top));
 			if ((uint)right > short.MaxValue) throwOutOfRange(nameof(right));
@@ -100,15 +95,15 @@ namespace PhotoSauce.MagicScaler
 			padRect = Rectangle.FromLTRB(left, top, right, bottom);
 		}
 
-		void IPixelTransformInternal.Init(WicProcessingContext ctx)
+		void IPixelTransformInternal.Init(PipelineContext ctx)
 		{
 			if (!padRect.IsEmpty)
 			{
 				MagicTransforms.AddExternalFormatConverter(ctx);
 
-				var innerRect = new Rectangle(padRect.Left, padRect.Top, (int)ctx.Source.Width, (int)ctx.Source.Height);
+				var innerRect = new Rectangle(padRect.Left, padRect.Top, ctx.Source.Width, ctx.Source.Height);
 				var outerRect = Rectangle.FromLTRB(0, 0, innerRect.Right + padRect.Right, innerRect.Bottom + padRect.Bottom);
-				ctx.Source = new PadTransformInternal(ctx.Source, padColor, innerRect, outerRect);
+				ctx.Source = new PadTransformInternal(ctx.Source, padColor, PixelArea.FromGdiRect(innerRect), PixelArea.FromGdiRect(outerRect));
 			}
 
 			Source = ctx.Source;
